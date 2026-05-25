@@ -168,6 +168,24 @@ export interface TaskUpdate {
   isActive?: boolean;
 }
 
+export interface RequiredChannel {
+  id: number;
+  channelId: string;
+  channelName: string;
+  addedBy: string;
+  isActive: boolean;
+  createdAt: string;
+}
+
+export interface ChannelInput {
+  channelId: string;
+  channelName: string;
+}
+
+export interface ChannelUpdate {
+  isActive: boolean;
+}
+
 export interface BonusGrant {
   telegramId: string;
   amount: number;

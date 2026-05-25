@@ -22,6 +22,8 @@ tags:
     description: Withdrawal requests
   - name: admin
     description: Admin controls
+  - name: channels
+    description: Required channel management
 paths:
   /healthz:
     get:
@@ -435,6 +437,94 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /admin/channels:
+    get:
+      operationId: adminListChannels
+      tags: [channels]
+      summary: List required channels (admin)
+      responses:
+        "200":
+          description: List of required channels
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RequiredChannel"
+    post:
+      operationId: adminAddChannel
+      tags: [channels]
+      summary: Add a required channel (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChannelInput"
+      responses:
+        "201":
+          description: Channel added
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequiredChannel"
+        "400":
+          description: Invalid or duplicate channel
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/channels/{channelId}:
+    patch:
+      operationId: adminUpdateChannel
+      tags: [channels]
+      summary: Activate or deactivate a required channel (admin)
+      parameters:
+        - name: channelId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChannelUpdate"
+      responses:
+        "200":
+          description: Channel updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequiredChannel"
+        "404":
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      operationId: adminDeleteChannel
+      tags: [channels]
+      summary: Remove a required channel (admin)
+      parameters:
+        - name: channelId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Channel removed
+        "404":
+          description: Channel not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /admin/bonus:
     post:
       operationId: adminGrantBonus
@@ -784,6 +874,40 @@ components:
           type: string
         rewardAmount:
           type: integer
+        isActive:
+          type: boolean
+
+    RequiredChannel:
+      type: object
+      required: [id, channelId, channelName, addedBy, isActive, createdAt]
+      properties:
+        id:
+          type: integer
+        channelId:
+          type: string
+        channelName:
+          type: string
+        addedBy:
+          type: string
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    ChannelInput:
+      type: object
+      required: [channelId, channelName]
+      properties:
+        channelId:
+          type: string
+        channelName:
+          type: string
+
+    ChannelUpdate:
+      type: object
+      required: [isActive]
+      properties:
         isActive:
           type: boolean
 

@@ -340,6 +340,58 @@ export const AdminDeleteTaskParams = zod.object({
 
 
 /**
+ * @summary List required channels (admin)
+ */
+export const AdminListChannelsResponseItem = zod.object({
+  "id": zod.number(),
+  "channelId": zod.string(),
+  "channelName": zod.string(),
+  "addedBy": zod.string(),
+  "isActive": zod.boolean(),
+  "createdAt": zod.coerce.date()
+})
+export const AdminListChannelsResponse = zod.array(AdminListChannelsResponseItem)
+
+
+/**
+ * @summary Add a required channel (admin)
+ */
+export const AdminAddChannelBody = zod.object({
+  "channelId": zod.string(),
+  "channelName": zod.string()
+})
+
+
+/**
+ * @summary Activate or deactivate a required channel (admin)
+ */
+export const AdminUpdateChannelParams = zod.object({
+  "channelId": zod.coerce.number()
+})
+
+export const AdminUpdateChannelBody = zod.object({
+  "isActive": zod.boolean()
+})
+
+export const AdminUpdateChannelResponse = zod.object({
+  "id": zod.number(),
+  "channelId": zod.string(),
+  "channelName": zod.string(),
+  "addedBy": zod.string(),
+  "isActive": zod.boolean(),
+  "createdAt": zod.coerce.date()
+})
+
+
+/**
+ * @summary Remove a required channel (admin)
+ */
+export const AdminDeleteChannelParams = zod.object({
+  "channelId": zod.coerce.number()
+})
+
+
+/**
  * @summary Grant a bonus to a user (admin)
  */
 export const AdminGrantBonusBody = zod.object({
