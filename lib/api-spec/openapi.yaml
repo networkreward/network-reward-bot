@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
-  version: 0.1.0
+  version: 0.2.0
   description: Telegram community bot API
 servers:
   - url: /api
@@ -18,6 +18,8 @@ tags:
     description: Task/mission system
   - name: leaderboard
     description: Leaderboard
+  - name: withdrawals
+    description: Withdrawal requests
   - name: admin
     description: Admin controls
 paths:
@@ -113,11 +115,38 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /users/{telegramId}/withdrawals:
+    get:
+      operationId: getUserWithdrawals
+      tags: [withdrawals]
+      summary: Get withdrawal history for a user
+      parameters:
+        - name: telegramId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Withdrawal history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Withdrawal"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /register:
     post:
       operationId: registerUser
       tags: [users]
-      summary: Register or get existing user (called on /start)
+      summary: Register or get existing user
       requestBody:
         required: true
         content:
@@ -184,11 +213,42 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /withdrawals:
+    post:
+      operationId: requestWithdrawal
+      tags: [withdrawals]
+      summary: Request a withdrawal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WithdrawalRequest"
+      responses:
+        "201":
+          description: Withdrawal requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Withdrawal"
+        "400":
+          description: Invalid request or insufficient balance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /leaderboard:
     get:
       operationId: getLeaderboard
       tags: [leaderboard]
-      summary: Get top users by referral count and points
+      summary: Get top users by referral count and balance
       parameters:
         - name: limit
           in: query
@@ -400,6 +460,58 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /admin/withdrawals:
+    get:
+      operationId: adminListWithdrawals
+      tags: [admin]
+      summary: List withdrawal requests (admin)
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, approved, rejected]
+      responses:
+        "200":
+          description: List of withdrawals
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WithdrawalDetail"
+
+  /admin/withdrawals/{withdrawalId}:
+    patch:
+      operationId: adminProcessWithdrawal
+      tags: [admin]
+      summary: Approve or reject a withdrawal (admin)
+      parameters:
+        - name: withdrawalId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WithdrawalAction"
+      responses:
+        "200":
+          description: Withdrawal processed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Withdrawal"
+        "404":
+          description: Withdrawal not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -418,7 +530,7 @@ components:
 
     User:
       type: object
-      required: [id, telegramId, username, balance, referralCount, isBanned, createdAt]
+      required: [id, telegramId, username, balance, referralCount, tasksCompletedCount, isBanned, flaggedForFraud, createdAt]
       properties:
         id:
           type: integer
@@ -434,10 +546,17 @@ components:
           type: integer
         referralCount:
           type: integer
+        tasksCompletedCount:
+          type: integer
         referredByTelegramId:
           type: ["string", "null"]
         isBanned:
           type: boolean
+        flaggedForFraud:
+          type: boolean
+        lastDailyBonusAt:
+          type: ["string", "null"]
+          format: date-time
         createdAt:
           type: string
           format: date-time
@@ -494,6 +613,60 @@ components:
           type: string
           format: date-time
 
+    Withdrawal:
+      type: object
+      required: [id, telegramId, amount, status, paymentMethod, paymentDetails, requestedAt]
+      properties:
+        id:
+          type: integer
+        telegramId:
+          type: string
+        amount:
+          type: integer
+        status:
+          type: string
+        paymentMethod:
+          type: string
+        paymentDetails:
+          type: string
+        adminNote:
+          type: ["string", "null"]
+        requestedAt:
+          type: string
+          format: date-time
+        processedAt:
+          type: ["string", "null"]
+          format: date-time
+
+    WithdrawalDetail:
+      type: object
+      required: [id, telegramId, amount, status, paymentMethod, paymentDetails, requestedAt, username]
+      properties:
+        id:
+          type: integer
+        telegramId:
+          type: string
+        username:
+          type: ["string", "null"]
+        firstName:
+          type: ["string", "null"]
+        amount:
+          type: integer
+        status:
+          type: string
+        paymentMethod:
+          type: string
+        paymentDetails:
+          type: string
+        adminNote:
+          type: ["string", "null"]
+        requestedAt:
+          type: string
+          format: date-time
+        processedAt:
+          type: ["string", "null"]
+          format: date-time
+
     LeaderboardEntry:
       type: object
       required: [rank, telegramId, username, balance, referralCount]
@@ -513,7 +686,7 @@ components:
 
     CommunityStats:
       type: object
-      required: [totalUsers, totalReferrals, totalPointsDistributed, activeTasks]
+      required: [totalUsers, totalReferrals, totalPointsDistributed, activeTasks, pendingWithdrawals, totalWithdrawn]
       properties:
         totalUsers:
           type: integer
@@ -522,6 +695,10 @@ components:
         totalPointsDistributed:
           type: integer
         activeTasks:
+          type: integer
+        pendingWithdrawals:
+          type: integer
+        totalWithdrawn:
           type: integer
 
     UserRegistration:
@@ -544,6 +721,29 @@ components:
       required: [telegramId]
       properties:
         telegramId:
+          type: string
+
+    WithdrawalRequest:
+      type: object
+      required: [telegramId, amount, paymentMethod, paymentDetails]
+      properties:
+        telegramId:
+          type: string
+        amount:
+          type: integer
+        paymentMethod:
+          type: string
+        paymentDetails:
+          type: string
+
+    WithdrawalAction:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [approved, rejected]
+        adminNote:
           type: string
 
     BalanceAdjustment:

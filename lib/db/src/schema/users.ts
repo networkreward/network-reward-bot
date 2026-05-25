@@ -10,8 +10,11 @@ export const usersTable = pgTable("users", {
   lastName: text("last_name"),
   balance: integer("balance").notNull().default(0),
   referralCount: integer("referral_count").notNull().default(0),
+  tasksCompletedCount: integer("tasks_completed_count").notNull().default(0),
   referredByTelegramId: text("referred_by_telegram_id"),
   isBanned: boolean("is_banned").notNull().default(false),
+  flaggedForFraud: boolean("flagged_for_fraud").notNull().default(false),
+  lastDailyBonusAt: timestamp("last_daily_bonus_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
 });

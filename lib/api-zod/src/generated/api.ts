@@ -3,7 +3,7 @@
  * Do not edit manually.
  * Api
  * Telegram community bot API
- * OpenAPI spec version: 0.1.0
+ * OpenAPI spec version: 0.2.0
  */
 import * as zod from 'zod';
 
@@ -31,8 +31,11 @@ export const GetUserResponse = zod.object({
   "lastName": zod.string().nullish(),
   "balance": zod.number(),
   "referralCount": zod.number(),
+  "tasksCompletedCount": zod.number(),
   "referredByTelegramId": zod.string().nullish(),
   "isBanned": zod.boolean(),
+  "flaggedForFraud": zod.boolean(),
+  "lastDailyBonusAt": zod.coerce.date().nullish(),
   "createdAt": zod.coerce.date()
 })
 
@@ -73,7 +76,28 @@ export const GetUserTasksResponse = zod.array(GetUserTasksResponseItem)
 
 
 /**
- * @summary Register or get existing user (called on /start)
+ * @summary Get withdrawal history for a user
+ */
+export const GetUserWithdrawalsParams = zod.object({
+  "telegramId": zod.coerce.string()
+})
+
+export const GetUserWithdrawalsResponseItem = zod.object({
+  "id": zod.number(),
+  "telegramId": zod.string(),
+  "amount": zod.number(),
+  "status": zod.string(),
+  "paymentMethod": zod.string(),
+  "paymentDetails": zod.string(),
+  "adminNote": zod.string().nullish(),
+  "requestedAt": zod.coerce.date(),
+  "processedAt": zod.coerce.date().nullish()
+})
+export const GetUserWithdrawalsResponse = zod.array(GetUserWithdrawalsResponseItem)
+
+
+/**
+ * @summary Register or get existing user
  */
 export const RegisterUserBody = zod.object({
   "telegramId": zod.string(),
@@ -91,8 +115,11 @@ export const RegisterUserResponse = zod.object({
   "lastName": zod.string().nullish(),
   "balance": zod.number(),
   "referralCount": zod.number(),
+  "tasksCompletedCount": zod.number(),
   "referredByTelegramId": zod.string().nullish(),
   "isBanned": zod.boolean(),
+  "flaggedForFraud": zod.boolean(),
+  "lastDailyBonusAt": zod.coerce.date().nullish(),
   "createdAt": zod.coerce.date()
 })
 
@@ -130,14 +157,28 @@ export const CompleteTaskResponse = zod.object({
   "lastName": zod.string().nullish(),
   "balance": zod.number(),
   "referralCount": zod.number(),
+  "tasksCompletedCount": zod.number(),
   "referredByTelegramId": zod.string().nullish(),
   "isBanned": zod.boolean(),
+  "flaggedForFraud": zod.boolean(),
+  "lastDailyBonusAt": zod.coerce.date().nullish(),
   "createdAt": zod.coerce.date()
 })
 
 
 /**
- * @summary Get top users by referral count and points
+ * @summary Request a withdrawal
+ */
+export const RequestWithdrawalBody = zod.object({
+  "telegramId": zod.string(),
+  "amount": zod.number(),
+  "paymentMethod": zod.string(),
+  "paymentDetails": zod.string()
+})
+
+
+/**
+ * @summary Get top users by referral count and balance
  */
 export const getLeaderboardQueryLimitDefault = 10;
 
@@ -163,7 +204,9 @@ export const GetStatsResponse = zod.object({
   "totalUsers": zod.number(),
   "totalReferrals": zod.number(),
   "totalPointsDistributed": zod.number(),
-  "activeTasks": zod.number()
+  "activeTasks": zod.number(),
+  "pendingWithdrawals": zod.number(),
+  "totalWithdrawn": zod.number()
 })
 
 
@@ -186,8 +229,11 @@ export const AdminListUsersResponseItem = zod.object({
   "lastName": zod.string().nullish(),
   "balance": zod.number(),
   "referralCount": zod.number(),
+  "tasksCompletedCount": zod.number(),
   "referredByTelegramId": zod.string().nullish(),
   "isBanned": zod.boolean(),
+  "flaggedForFraud": zod.boolean(),
+  "lastDailyBonusAt": zod.coerce.date().nullish(),
   "createdAt": zod.coerce.date()
 })
 export const AdminListUsersResponse = zod.array(AdminListUsersResponseItem)
@@ -213,8 +259,11 @@ export const AdminUpdateBalanceResponse = zod.object({
   "lastName": zod.string().nullish(),
   "balance": zod.number(),
   "referralCount": zod.number(),
+  "tasksCompletedCount": zod.number(),
   "referredByTelegramId": zod.string().nullish(),
   "isBanned": zod.boolean(),
+  "flaggedForFraud": zod.boolean(),
+  "lastDailyBonusAt": zod.coerce.date().nullish(),
   "createdAt": zod.coerce.date()
 })
 
@@ -238,8 +287,11 @@ export const AdminBanUserResponse = zod.object({
   "lastName": zod.string().nullish(),
   "balance": zod.number(),
   "referralCount": zod.number(),
+  "tasksCompletedCount": zod.number(),
   "referredByTelegramId": zod.string().nullish(),
   "isBanned": zod.boolean(),
+  "flaggedForFraud": zod.boolean(),
+  "lastDailyBonusAt": zod.coerce.date().nullish(),
   "createdAt": zod.coerce.date()
 })
 
@@ -304,9 +356,60 @@ export const AdminGrantBonusResponse = zod.object({
   "lastName": zod.string().nullish(),
   "balance": zod.number(),
   "referralCount": zod.number(),
+  "tasksCompletedCount": zod.number(),
   "referredByTelegramId": zod.string().nullish(),
   "isBanned": zod.boolean(),
+  "flaggedForFraud": zod.boolean(),
+  "lastDailyBonusAt": zod.coerce.date().nullish(),
   "createdAt": zod.coerce.date()
+})
+
+
+/**
+ * @summary List withdrawal requests (admin)
+ */
+export const AdminListWithdrawalsQueryParams = zod.object({
+  "status": zod.enum(['pending', 'approved', 'rejected']).optional()
+})
+
+export const AdminListWithdrawalsResponseItem = zod.object({
+  "id": zod.number(),
+  "telegramId": zod.string(),
+  "username": zod.string().nullable(),
+  "firstName": zod.string().nullish(),
+  "amount": zod.number(),
+  "status": zod.string(),
+  "paymentMethod": zod.string(),
+  "paymentDetails": zod.string(),
+  "adminNote": zod.string().nullish(),
+  "requestedAt": zod.coerce.date(),
+  "processedAt": zod.coerce.date().nullish()
+})
+export const AdminListWithdrawalsResponse = zod.array(AdminListWithdrawalsResponseItem)
+
+
+/**
+ * @summary Approve or reject a withdrawal (admin)
+ */
+export const AdminProcessWithdrawalParams = zod.object({
+  "withdrawalId": zod.coerce.number()
+})
+
+export const AdminProcessWithdrawalBody = zod.object({
+  "action": zod.enum(['approved', 'rejected']),
+  "adminNote": zod.string().optional()
+})
+
+export const AdminProcessWithdrawalResponse = zod.object({
+  "id": zod.number(),
+  "telegramId": zod.string(),
+  "amount": zod.number(),
+  "status": zod.string(),
+  "paymentMethod": zod.string(),
+  "paymentDetails": zod.string(),
+  "adminNote": zod.string().nullish(),
+  "requestedAt": zod.coerce.date(),
+  "processedAt": zod.coerce.date().nullish()
 })
 
 

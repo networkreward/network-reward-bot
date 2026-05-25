@@ -3,10 +3,12 @@
  * Do not edit manually.
  * Api
  * Telegram community bot API
- * OpenAPI spec version: 0.1.0
+ * OpenAPI spec version: 0.2.0
  */
 
 export * from './adminListUsersParams';
+export * from './adminListWithdrawalsParams';
+export * from './adminListWithdrawalsStatus';
 export * from './balanceAdjustment';
 export * from './banAction';
 export * from './bonusGrant';
@@ -23,3 +25,8 @@ export * from './taskUpdate';
 export * from './user';
 export * from './userRegistration';
 export * from './userTask';
+export * from './withdrawal';
+export * from './withdrawalAction';
+export * from './withdrawalActionAction';
+export * from './withdrawalDetail';
+export * from './withdrawalRequest';

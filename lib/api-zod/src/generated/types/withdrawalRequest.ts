@@ -6,6 +6,9 @@
  * OpenAPI spec version: 0.2.0
  */
 
-export interface BanAction {
-  banned: boolean;
+export interface WithdrawalRequest {
+  telegramId: string;
+  amount: number;
+  paymentMethod: string;
+  paymentDetails: string;
 }

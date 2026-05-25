@@ -3,7 +3,7 @@
  * Do not edit manually.
  * Api
  * Telegram community bot API
- * OpenAPI spec version: 0.1.0
+ * OpenAPI spec version: 0.2.0
  */
 
 export interface User {
@@ -17,8 +17,12 @@ export interface User {
   lastName?: string | null;
   balance: number;
   referralCount: number;
+  tasksCompletedCount: number;
   /** @nullable */
   referredByTelegramId?: string | null;
   isBanned: boolean;
+  flaggedForFraud: boolean;
+  /** @nullable */
+  lastDailyBonusAt?: Date | null;
   createdAt: Date;
 }

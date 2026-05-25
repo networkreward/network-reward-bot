@@ -3,7 +3,7 @@
  * Do not edit manually.
  * Api
  * Telegram community bot API
- * OpenAPI spec version: 0.1.0
+ * OpenAPI spec version: 0.2.0
  */
 export interface HealthStatus {
   status: string;
@@ -24,9 +24,13 @@ export interface User {
   lastName?: string | null;
   balance: number;
   referralCount: number;
+  tasksCompletedCount: number;
   /** @nullable */
   referredByTelegramId?: string | null;
   isBanned: boolean;
+  flaggedForFraud: boolean;
+  /** @nullable */
+  lastDailyBonusAt?: string | null;
   createdAt: string;
 }
 
@@ -57,6 +61,38 @@ export interface UserTask {
   completedAt: string;
 }
 
+export interface Withdrawal {
+  id: number;
+  telegramId: string;
+  amount: number;
+  status: string;
+  paymentMethod: string;
+  paymentDetails: string;
+  /** @nullable */
+  adminNote?: string | null;
+  requestedAt: string;
+  /** @nullable */
+  processedAt?: string | null;
+}
+
+export interface WithdrawalDetail {
+  id: number;
+  telegramId: string;
+  /** @nullable */
+  username: string | null;
+  /** @nullable */
+  firstName?: string | null;
+  amount: number;
+  status: string;
+  paymentMethod: string;
+  paymentDetails: string;
+  /** @nullable */
+  adminNote?: string | null;
+  requestedAt: string;
+  /** @nullable */
+  processedAt?: string | null;
+}
+
 export interface LeaderboardEntry {
   rank: number;
   telegramId: string;
@@ -73,6 +109,8 @@ export interface CommunityStats {
   totalReferrals: number;
   totalPointsDistributed: number;
   activeTasks: number;
+  pendingWithdrawals: number;
+  totalWithdrawn: number;
 }
 
 export interface UserRegistration {
@@ -85,6 +123,26 @@ export interface UserRegistration {
 
 export interface TaskCompletion {
   telegramId: string;
+}
+
+export interface WithdrawalRequest {
+  telegramId: string;
+  amount: number;
+  paymentMethod: string;
+  paymentDetails: string;
+}
+
+export type WithdrawalActionAction = typeof WithdrawalActionAction[keyof typeof WithdrawalActionAction];
+
+
+export const WithdrawalActionAction = {
+  approved: 'approved',
+  rejected: 'rejected',
+} as const;
+
+export interface WithdrawalAction {
+  action: WithdrawalActionAction;
+  adminNote?: string;
 }
 
 export interface BalanceAdjustment {
@@ -124,4 +182,17 @@ export type AdminListUsersParams = {
 limit?: number;
 offset?: number;
 };
+
+export type AdminListWithdrawalsParams = {
+status?: AdminListWithdrawalsStatus;
+};
+
+export type AdminListWithdrawalsStatus = typeof AdminListWithdrawalsStatus[keyof typeof AdminListWithdrawalsStatus];
+
+
+export const AdminListWithdrawalsStatus = {
+  pending: 'pending',
+  approved: 'approved',
+  rejected: 'rejected',
+} as const;
 

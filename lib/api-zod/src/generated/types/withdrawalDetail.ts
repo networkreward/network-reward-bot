@@ -6,13 +6,20 @@
  * OpenAPI spec version: 0.2.0
  */
 
-export interface LeaderboardEntry {
-  rank: number;
+export interface WithdrawalDetail {
+  id: number;
   telegramId: string;
   /** @nullable */
   username: string | null;
   /** @nullable */
   firstName?: string | null;
-  balance: number;
-  referralCount: number;
+  amount: number;
+  status: string;
+  paymentMethod: string;
+  paymentDetails: string;
+  /** @nullable */
+  adminNote?: string | null;
+  requestedAt: Date;
+  /** @nullable */
+  processedAt?: Date | null;
 }
