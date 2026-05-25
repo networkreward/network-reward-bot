@@ -6,6 +6,9 @@
  * OpenAPI spec version: 0.1.0
  */
 
-export interface HealthStatus {
-  status: string;
+export interface TaskInput {
+  title: string;
+  description: string;
+  rewardAmount: number;
+  isActive?: boolean;
 }

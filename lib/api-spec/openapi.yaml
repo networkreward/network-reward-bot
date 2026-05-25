@@ -3,20 +3,29 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Telegram community bot API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: users
+    description: User management
+  - name: referrals
+    description: Referral system
+  - name: tasks
+    description: Task/mission system
+  - name: leaderboard
+    description: Leaderboard
+  - name: admin
+    description: Admin controls
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,13 +33,567 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /users/{telegramId}:
+    get:
+      operationId: getUser
+      tags: [users]
+      summary: Get user by Telegram ID
+      parameters:
+        - name: telegramId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: User found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /users/{telegramId}/referrals:
+    get:
+      operationId: getUserReferrals
+      tags: [referrals]
+      summary: Get referrals made by a user
+      parameters:
+        - name: telegramId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of referrals
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Referral"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /users/{telegramId}/tasks:
+    get:
+      operationId: getUserTasks
+      tags: [tasks]
+      summary: Get task completions for a user
+      parameters:
+        - name: telegramId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of user task completions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UserTask"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /register:
+    post:
+      operationId: registerUser
+      tags: [users]
+      summary: Register or get existing user (called on /start)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserRegistration"
+      responses:
+        "200":
+          description: User registered or retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+
+  /tasks:
+    get:
+      operationId: listTasks
+      tags: [tasks]
+      summary: List all active tasks
+      responses:
+        "200":
+          description: List of tasks
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Task"
+
+  /tasks/{taskId}/complete:
+    post:
+      operationId: completeTask
+      tags: [tasks]
+      summary: Mark a task as completed for a user
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskCompletion"
+      responses:
+        "200":
+          description: Task completed, reward granted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          description: Already completed or invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Task or user not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /leaderboard:
+    get:
+      operationId: getLeaderboard
+      tags: [leaderboard]
+      summary: Get top users by referral count and points
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        "200":
+          description: Leaderboard entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LeaderboardEntry"
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [admin]
+      summary: Get overall community stats
+      responses:
+        "200":
+          description: Community statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommunityStats"
+
+  /admin/users:
+    get:
+      operationId: adminListUsers
+      tags: [admin]
+      summary: List all users (admin)
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: List of users
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/User"
+
+  /admin/users/{telegramId}/balance:
+    patch:
+      operationId: adminUpdateBalance
+      tags: [admin]
+      summary: Adjust user balance (admin)
+      parameters:
+        - name: telegramId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BalanceAdjustment"
+      responses:
+        "200":
+          description: Balance updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/users/{telegramId}/ban:
+    patch:
+      operationId: adminBanUser
+      tags: [admin]
+      summary: Ban or unban a user (admin)
+      parameters:
+        - name: telegramId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BanAction"
+      responses:
+        "200":
+          description: Ban status updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/tasks:
+    post:
+      operationId: adminCreateTask
+      tags: [admin]
+      summary: Create a new task (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskInput"
+      responses:
+        "201":
+          description: Task created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+
+  /admin/tasks/{taskId}:
+    patch:
+      operationId: adminUpdateTask
+      tags: [admin]
+      summary: Update a task (admin)
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskUpdate"
+      responses:
+        "200":
+          description: Task updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "404":
+          description: Task not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      operationId: adminDeleteTask
+      tags: [admin]
+      summary: Delete a task (admin)
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Task deleted
+        "404":
+          description: Task not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/bonus:
+    post:
+      operationId: adminGrantBonus
+      tags: [admin]
+      summary: Grant a bonus to a user (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BonusGrant"
+      responses:
+        "200":
+          description: Bonus granted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
       type: object
+      required: [status]
       properties:
         status:
           type: string
-      required:
-        - status
 
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    User:
+      type: object
+      required: [id, telegramId, username, balance, referralCount, isBanned, createdAt]
+      properties:
+        id:
+          type: integer
+        telegramId:
+          type: string
+        username:
+          type: ["string", "null"]
+        firstName:
+          type: ["string", "null"]
+        lastName:
+          type: ["string", "null"]
+        balance:
+          type: integer
+        referralCount:
+          type: integer
+        referredByTelegramId:
+          type: ["string", "null"]
+        isBanned:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    Referral:
+      type: object
+      required: [id, referrerId, referredId, rewardAmount, createdAt]
+      properties:
+        id:
+          type: integer
+        referrerId:
+          type: string
+        referredId:
+          type: string
+        referredUsername:
+          type: ["string", "null"]
+        rewardAmount:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+
+    Task:
+      type: object
+      required: [id, title, description, rewardAmount, isActive, createdAt]
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        description:
+          type: string
+        rewardAmount:
+          type: integer
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    UserTask:
+      type: object
+      required: [id, taskId, taskTitle, rewardAmount, completedAt]
+      properties:
+        id:
+          type: integer
+        taskId:
+          type: integer
+        taskTitle:
+          type: string
+        rewardAmount:
+          type: integer
+        completedAt:
+          type: string
+          format: date-time
+
+    LeaderboardEntry:
+      type: object
+      required: [rank, telegramId, username, balance, referralCount]
+      properties:
+        rank:
+          type: integer
+        telegramId:
+          type: string
+        username:
+          type: ["string", "null"]
+        firstName:
+          type: ["string", "null"]
+        balance:
+          type: integer
+        referralCount:
+          type: integer
+
+    CommunityStats:
+      type: object
+      required: [totalUsers, totalReferrals, totalPointsDistributed, activeTasks]
+      properties:
+        totalUsers:
+          type: integer
+        totalReferrals:
+          type: integer
+        totalPointsDistributed:
+          type: integer
+        activeTasks:
+          type: integer
+
+    UserRegistration:
+      type: object
+      required: [telegramId]
+      properties:
+        telegramId:
+          type: string
+        username:
+          type: string
+        firstName:
+          type: string
+        lastName:
+          type: string
+        referredByTelegramId:
+          type: string
+
+    TaskCompletion:
+      type: object
+      required: [telegramId]
+      properties:
+        telegramId:
+          type: string
+
+    BalanceAdjustment:
+      type: object
+      required: [amount, reason]
+      properties:
+        amount:
+          type: integer
+        reason:
+          type: string
+
+    BanAction:
+      type: object
+      required: [banned]
+      properties:
+        banned:
+          type: boolean
+
+    TaskInput:
+      type: object
+      required: [title, description, rewardAmount]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        rewardAmount:
+          type: integer
+        isActive:
+          type: boolean
+
+    TaskUpdate:
+      type: object
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        rewardAmount:
+          type: integer
+        isActive:
+          type: boolean
+
+    BonusGrant:
+      type: object
+      required: [telegramId, amount, reason]
+      properties:
+        telegramId:
+          type: string
+        amount:
+          type: integer
+        reason:
+          type: string

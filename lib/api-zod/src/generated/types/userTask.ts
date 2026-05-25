@@ -6,6 +6,10 @@
  * OpenAPI spec version: 0.1.0
  */
 
-export interface HealthStatus {
-  status: string;
+export interface UserTask {
+  id: number;
+  taskId: number;
+  taskTitle: string;
+  rewardAmount: number;
+  completedAt: Date;
 }
