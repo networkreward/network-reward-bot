@@ -186,6 +186,63 @@ export interface ChannelUpdate {
   isActive: boolean;
 }
 
+export type BroadcastType = typeof BroadcastType[keyof typeof BroadcastType];
+
+
+export const BroadcastType = {
+  text: 'text',
+  photo: 'photo',
+  video: 'video',
+} as const;
+
+export type BroadcastStatus = typeof BroadcastStatus[keyof typeof BroadcastStatus];
+
+
+export const BroadcastStatus = {
+  scheduled: 'scheduled',
+  sending: 'sending',
+  completed: 'completed',
+  failed: 'failed',
+  cancelled: 'cancelled',
+} as const;
+
+export type BroadcastTargetFilter = typeof BroadcastTargetFilter[keyof typeof BroadcastTargetFilter];
+
+
+export const BroadcastTargetFilter = {
+  all: 'all',
+  active: 'active',
+} as const;
+
+export interface Broadcast {
+  id: number;
+  type: BroadcastType;
+  content: string;
+  mediaFileId?: string | null;
+  status: BroadcastStatus;
+  targetFilter: BroadcastTargetFilter;
+  totalTargets: number;
+  sentCount: number;
+  failedCount: number;
+  blockedCount: number;
+  scheduledAt?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface BotSetting {
+  key: string;
+  value: string;
+  updatedBy?: string;
+  updatedAt: string;
+}
+
+export interface BotSettingUpdate {
+  value: string;
+}
+
 export interface BonusGrant {
   telegramId: string;
   amount: number;

@@ -911,6 +911,73 @@ components:
         isActive:
           type: boolean
 
+    Broadcast:
+      type: object
+      required: [id, type, content, status, targetFilter, totalTargets, sentCount, failedCount, blockedCount, createdBy, createdAt]
+      properties:
+        id:
+          type: integer
+        type:
+          type: string
+          enum: [text, photo, video]
+        content:
+          type: string
+        mediaFileId:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [scheduled, sending, completed, failed, cancelled]
+        targetFilter:
+          type: string
+          enum: [all, active]
+        totalTargets:
+          type: integer
+        sentCount:
+          type: integer
+        failedCount:
+          type: integer
+        blockedCount:
+          type: integer
+        scheduledAt:
+          type: string
+          format: date-time
+          nullable: true
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    BotSetting:
+      type: object
+      required: [key, value, updatedAt]
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        updatedBy:
+          type: string
+        updatedAt:
+          type: string
+          format: date-time
+
+    BotSettingUpdate:
+      type: object
+      required: [value]
+      properties:
+        value:
+          type: string
+
     BonusGrant:
       type: object
       required: [telegramId, amount, reason]
