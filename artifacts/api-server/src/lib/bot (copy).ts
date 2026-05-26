@@ -1,9 +1,8 @@
- import {import{ Telegraf, Markup } from "telegraf";
+ import { Telegraf, Markup } from "telegraf";
 import { eq, sql, desc, and, gt, lt, count } from "drizzle-orm";
 import { db } from "@workspace/db";
-  usersTable,
-  referralsTable,
-  tasksTable,
+ 
+tasksTable,
   userTasksTable,
   withdrawalsTable,
   requiredChannelsTable,

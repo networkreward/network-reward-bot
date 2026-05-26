@@ -21,6 +21,7 @@
     "telegraf": "^4.16.3"
   },
   "devDependencies": {
+    "@esbuild/android-arm64": "0.27.3",
     "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
