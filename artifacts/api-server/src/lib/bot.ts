@@ -14,6 +14,16 @@ import {
   type RequiredChannel,
 } from "@workspace/db";
 import { logger } from "./logger";
+import {
+  checkAndSendScheduledReports,
+  sendLargeWithdrawalAlert,
+  sendFraudAlert,
+  generateDailyReport,
+  generateWeeklyReport,
+  getReportConfig,
+  setReportDailyHour,
+  setReportLargeThreshold,
+} from "./reporter";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const REFERRAL_REWARD = 800;
@@ -322,6 +332,7 @@ export function createBot(token: string): Telegraf {
   // ─── Scheduled broadcast processor ───────────────────────────────────────
   setInterval(() => {
     processScheduledBroadcasts(bot.telegram).catch((err) => logger.error({ err }, "Erreur vérification diffusions"));
+    checkAndSendScheduledReports(bot.telegram, adminIds()).catch((err) => logger.error({ err }, "Erreur rapport auto"));
   }, 60_000);
 
   // ─── VIP rank helper ──────────────────────────────────────────────────────
@@ -626,6 +637,8 @@ export function createBot(token: string): Telegraf {
           const isFraud = await detectFraud(referredByTelegramId, now);
           if (isFraud) {
             await db.update(usersTable).set({ flaggedForFraud: true }).where(eq(usersTable.telegramId, referredByTelegramId));
+            const [flaggedRef] = await db.select().from(usersTable).where(eq(usersTable.telegramId, referredByTelegramId));
+            if (flaggedRef) sendFraudAlert(bot.telegram, adminIds(), flaggedRef).catch(() => {});
           } else {
             await db.insert(referralsTable).values({ referrerId: referredByTelegramId, referredId: telegramId, rewardAmount: REFERRAL_REWARD }).onConflictDoNothing();
             await db.update(usersTable)
@@ -1026,6 +1039,9 @@ export function createBot(token: string): Telegraf {
           .set({ proofMessageId: String(proofResult.messageId), proofChannelId: proofResult.channelId })
           .where(eq(withdrawalsTable.id, withdrawal!.id));
       }
+
+      // Large withdrawal alert
+      await sendLargeWithdrawalAlert(bot.telegram, adminIds(), { id: withdrawal!.id, amount: savedAmount, paymentMethod: savedMethod, telegramId }, displayName).catch(() => {});
 
       // Notify admins
       for (const adminId of adminIds()) {
@@ -1642,6 +1658,77 @@ export function createBot(token: string): Telegraf {
       `🔍 <b>Résultats (${results.length})</b>\n\n${lines.join("\n\n")}\n\n<i>Utilisez /admin_user &lt;ID&gt; pour le profil complet.</i>`,
       { parse_mode: "HTML" }
     );
+  });
+
+  // =========================================================================
+  // ADMIN REPORT COMMANDS
+  // =========================================================================
+
+  bot.command("admin_rapport_quotidien", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    await ctx.reply("⏳ <b>Génération du rapport quotidien...</b>", { parse_mode: "HTML" });
+    try {
+      const report = await generateDailyReport();
+      await ctx.reply(report, { parse_mode: "HTML" });
+    } catch (err) {
+      logger.error({ err }, "Erreur génération rapport quotidien");
+      await ctx.reply("❌ Erreur lors de la génération du rapport.");
+    }
+  });
+
+  bot.command("admin_rapport_hebdo", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    await ctx.reply("⏳ <b>Génération du rapport hebdomadaire...</b>", { parse_mode: "HTML" });
+    try {
+      const report = await generateWeeklyReport();
+      await ctx.reply(report, { parse_mode: "HTML" });
+    } catch (err) {
+      logger.error({ err }, "Erreur génération rapport hebdomadaire");
+      await ctx.reply("❌ Erreur lors de la génération du rapport.");
+    }
+  });
+
+  bot.command("admin_rapport_config", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const parts = ctx.message.text.split(" ");
+    const sub   = parts[1]?.toLowerCase();
+
+    if (!sub) {
+      const cfg = await getReportConfig();
+      const fmtDate = (d: Date | null) => d ? d.toLocaleString("fr-FR") : "Jamais";
+      await ctx.reply(
+        `⚙️ <b>Configuration des Rapports</b>\n\n` +
+        `🕗 Heure d'envoi (UTC) : <b>${cfg.dailyHour}h00</b>\n` +
+        `💵 Seuil alerte retrait : <b>${cfg.largeThreshold.toLocaleString("fr-FR")} F</b>\n\n` +
+        `📊 Dernier rapport quotidien : <i>${fmtDate(cfg.lastDaily)}</i>\n` +
+        `📈 Dernier rapport hebdo : <i>${fmtDate(cfg.lastWeekly)}</i>\n\n` +
+        `<b>Commandes :</b>\n` +
+        `• /admin_rapport_config heure <code>8</code> — heure d'envoi (0-23 UTC)\n` +
+        `• /admin_rapport_config seuil <code>25000</code> — seuil alerte retrait\n` +
+        `• /admin_rapport_quotidien — rapport maintenant\n` +
+        `• /admin_rapport_hebdo — rapport hebdo maintenant`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (sub === "heure") {
+      const hour = parseInt(parts[2] ?? "", 10);
+      if (isNaN(hour) || hour < 0 || hour > 23) { await ctx.reply("❌ Heure invalide (0-23)."); return; }
+      await setReportDailyHour(hour);
+      await ctx.reply(`✅ Rapports automatiques configurés à <b>${hour}h00 UTC</b> chaque jour.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    if (sub === "seuil") {
+      const amount = parseInt(parts[2] ?? "", 10);
+      if (isNaN(amount) || amount <= 0) { await ctx.reply("❌ Montant invalide."); return; }
+      await setReportLargeThreshold(amount);
+      await ctx.reply(`✅ Seuil d'alerte retrait mis à <b>${amount.toLocaleString("fr-FR")} F</b>.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    await ctx.reply("Sous-commandes : heure <h> | seuil <montant>");
   });
 
   bot.catch((err, ctx) => {
