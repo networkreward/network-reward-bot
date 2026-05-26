@@ -1,7 +1,6 @@
-import { Telegraf, Markup } from "telegraf";
+ import {import{ Telegraf, Markup } from "telegraf";
 import { eq, sql, desc, and, gt, lt, count } from "drizzle-orm";
 import { db } from "@workspace/db";
-import {
   usersTable,
   referralsTable,
   tasksTable,
@@ -1780,8 +1779,6 @@ function parseFrDate(input: string): Date | null {
 }
 import express from "express";
 
-const app = express();
-
 app.get("/", (req, res) => {
   res.send("Bot Telegram actif ✅");
 });
@@ -1791,3 +1788,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Serveur web actif sur le port ${PORT}`);
 });
+node index.js
