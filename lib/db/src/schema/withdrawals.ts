@@ -10,6 +10,8 @@ export const withdrawalsTable = pgTable("withdrawals", {
   paymentMethod: text("payment_method").notNull(),
   paymentDetails: text("payment_details").notNull(),
   adminNote: text("admin_note"),
+  proofMessageId: text("proof_message_id"),
+  proofChannelId: text("proof_channel_id"),
   requestedAt: timestamp("requested_at", { withTimezone: true }).notNull().defaultNow(),
   processedAt: timestamp("processed_at", { withTimezone: true }),
 });

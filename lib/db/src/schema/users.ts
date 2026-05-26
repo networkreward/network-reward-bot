@@ -14,6 +14,7 @@ export const usersTable = pgTable("users", {
   referredByTelegramId: text("referred_by_telegram_id"),
   isBanned: boolean("is_banned").notNull().default(false),
   flaggedForFraud: boolean("flagged_for_fraud").notNull().default(false),
+  welcomeBonusClaimed: boolean("welcome_bonus_claimed").notNull().default(false),
   lastDailyBonusAt: timestamp("last_daily_bonus_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),

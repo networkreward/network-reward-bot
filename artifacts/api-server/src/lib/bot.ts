@@ -1,5 +1,5 @@
 import { Telegraf, Markup } from "telegraf";
-import { eq, sql, desc, and, gt, lt, count, ne } from "drizzle-orm";
+import { eq, sql, desc, and, gt, lt, count } from "drizzle-orm";
 import { db } from "@workspace/db";
 import {
   usersTable,
@@ -12,32 +12,36 @@ import {
   botSettingsTable,
   SETTING_KEYS,
   type RequiredChannel,
-  type Broadcast,
 } from "@workspace/db";
 import { logger } from "./logger";
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 const REFERRAL_REWARD = 800;
 const DAILY_BONUS = 200;
+const WELCOME_BONUS = 500;
 const MIN_WITHDRAWAL = 10_000;
 const MIN_TASKS_FOR_BONUS = 1;
 const DAILY_BONUS_HOURS = 24;
 const FRAUD_REFERRAL_WINDOW_MS = 5 * 60 * 1000;
 const FRAUD_REFERRAL_MAX = 5;
-const BROADCAST_DELAY_MS = 50; // safe rate: ~20 msg/s (Telegram limit: 30/s)
+const BROADCAST_DELAY_MS = 50;
 const ACTIVE_USER_DAYS = 30;
+const WITHDRAWAL_PROOF_CHANNEL_KEY = "withdrawal_proof_channel";
+const DEFAULT_PROOF_CHANNEL = "@NetworkRetrait";
 
 // ─── Settings cache ───────────────────────────────────────────────────────────
 interface SettingsCache {
   maintenanceMode: boolean;
   maintenanceMessage: string;
   welcomeMessage: string | null;
+  withdrawalProofChannel: string;
   refreshedAt: number;
 }
 let settingsCache: SettingsCache = {
   maintenanceMode: false,
   maintenanceMessage: "🔧 Le bot est en maintenance. Revenez bientôt !",
   welcomeMessage: null,
+  withdrawalProofChannel: DEFAULT_PROOF_CHANNEL,
   refreshedAt: 0,
 };
 const CACHE_TTL_MS = 30_000;
@@ -49,14 +53,13 @@ async function refreshSettingsCache(): Promise<void> {
     maintenanceMode: map.get(SETTING_KEYS.MAINTENANCE_MODE) === "true",
     maintenanceMessage: map.get(SETTING_KEYS.MAINTENANCE_MESSAGE) ?? "🔧 Le bot est en maintenance. Revenez bientôt !",
     welcomeMessage: map.get(SETTING_KEYS.WELCOME_MESSAGE) ?? null,
+    withdrawalProofChannel: map.get(WITHDRAWAL_PROOF_CHANNEL_KEY) ?? DEFAULT_PROOF_CHANNEL,
     refreshedAt: Date.now(),
   };
 }
 
 async function getSettings(): Promise<SettingsCache> {
-  if (Date.now() - settingsCache.refreshedAt > CACHE_TTL_MS) {
-    await refreshSettingsCache();
-  }
+  if (Date.now() - settingsCache.refreshedAt > CACHE_TTL_MS) await refreshSettingsCache();
   return settingsCache;
 }
 
@@ -80,7 +83,7 @@ type AdminSettingStep = "welcome_content" | "maintenance_message";
 interface AdminSettingState { step: AdminSettingStep; }
 const adminSettingState = new Map<string, AdminSettingState>();
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function adminIds(): string[] {
   return (process.env["ADMIN_TELEGRAM_IDS"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
@@ -112,13 +115,13 @@ async function requireChannels(ctx: any): Promise<boolean> {
   const telegramId = String(ctx.from?.id ?? "");
   const missing = await getMissingChannels(ctx.telegram, telegramId);
   if (missing.length === 0) return true;
-  const channelList = missing.map((ch) => `• ${ch.channelName} (<code>${ch.channelId}</code>)`).join("\n");
+  const channelList = missing.map((ch) => `• ${ch.channelName}`).join("\n");
   await ctx.reply(
-    `🔒 <b>Accès requis</b>\n\nPour utiliser ce bot, rejoignez ${missing.length === 1 ? "ce canal" : "ces canaux"} :\n\n${channelList}\n\nRejoignez-les puis appuyez sur ✅ Vérifier.`,
+    `🔒 <b>Accès requis</b>\n\nRejoignez ${missing.length === 1 ? "ce canal" : "ces canaux"} pour utiliser le bot :\n\n${channelList}\n\nCliquez sur chaque bouton puis vérifiez.`,
     {
       parse_mode: "HTML",
       ...Markup.inlineKeyboard([
-        ...missing.map((ch) => [Markup.button.url(`📢 Rejoindre ${ch.channelName}`, `https://t.me/${ch.channelId.replace("@", "")}`)]),
+        ...missing.map((ch) => [Markup.button.url(`📢 ${ch.channelName}`, `https://t.me/${ch.channelId.replace("@", "")}`)]),
         [Markup.button.callback("✅ Vérifier mon adhésion", "verify_membership")],
       ]),
     }
@@ -139,10 +142,7 @@ async function detectFraud(referrerId: string, referredCreatedAt: Date): Promise
     .where(and(eq(referralsTable.referrerId, referrerId), gt(referralsTable.createdAt, windowStart)));
   if ((recent?.c ?? 0) >= FRAUD_REFERRAL_MAX) return true;
   const [referrer] = await db.select().from(usersTable).where(eq(usersTable.telegramId, referrerId));
-  if (referrer) {
-    const timeDiff = Math.abs(referredCreatedAt.getTime() - referrer.createdAt.getTime());
-    if (timeDiff < 30_000) return true;
-  }
+  if (referrer && Math.abs(referredCreatedAt.getTime() - referrer.createdAt.getTime()) < 30_000) return true;
   return false;
 }
 
@@ -157,7 +157,7 @@ function mainMenu() {
 
 async function isAdmin(ctx: any): Promise<boolean> {
   if (!adminIds().includes(String(ctx.from?.id ?? ""))) {
-    await ctx.reply("❌ Vous n'êtes pas autorisé à utiliser les commandes administrateur.");
+    await ctx.reply("❌ Commande réservée aux administrateurs.");
     return false;
   }
   return true;
@@ -173,109 +173,245 @@ async function setSetting(key: string, value: string, updatedBy: string): Promis
     target: botSettingsTable.key,
     set: { value, updatedBy, updatedAt: new Date() },
   });
-  settingsCache.refreshedAt = 0; // invalidate cache
+  settingsCache.refreshedAt = 0;
+}
+
+async function getBotUsername(telegram: Telegraf["telegram"]): Promise<string> {
+  try { const me = await telegram.getMe(); return me.username ?? "bot"; } catch { return "bot"; }
+}
+
+// ─── Withdrawal proof message ─────────────────────────────────────────────────
+function buildProofMessage(
+  w: { id: number; amount: number; paymentMethod: string; requestedAt: Date },
+  displayName: string,
+  status: "pending" | "approved" | "rejected",
+  extra?: { approvedAt?: Date; reason?: string }
+): string {
+  const reqDate = w.requestedAt.toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+
+  let statusLine: string;
+  let extraLines = "";
+
+  if (status === "pending") {
+    statusLine = "🟡 <b>Statut :</b> EN COURS DE TRAITEMENT";
+  } else if (status === "approved") {
+    statusLine = "🟢 <b>Statut :</b> RETRAIT REÇU ✅";
+    const approvedDate = extra?.approvedAt?.toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }) ?? "—";
+    extraLines = `\n✅ <b>Confirmé le :</b> ${approvedDate}`;
+  } else {
+    statusLine = "🔴 <b>Statut :</b> REFUSÉ ❌";
+    if (extra?.reason) extraLines = `\n📝 <b>Raison :</b> <i>${extra.reason}</i>`;
+  }
+
+  return (
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `      💸  <b>PREUVE DE RETRAIT</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `${statusLine}\n\n` +
+    `🆔 <b>Référence :</b>  <code>#${String(w.id).padStart(5, "0")}</code>\n` +
+    `👤 <b>Bénéficiaire :</b>  ${displayName}\n` +
+    `💵 <b>Montant :</b>  <b>${w.amount.toLocaleString("fr-FR")} F</b>\n` +
+    `💳 <b>Méthode :</b>  ${w.paymentMethod}\n` +
+    `📅 <b>Demande le :</b>  ${reqDate}` +
+    `${extraLines}\n` +
+    `⏳ <b>Délai estimé :</b>  moins de 1 heure\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `🏦  <b>NETWORK COMMUNITY</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━`
+  );
+}
+
+async function sendWithdrawalProof(
+  telegram: Telegraf["telegram"],
+  proofChannel: string,
+  w: { id: number; amount: number; paymentMethod: string; requestedAt: Date },
+  displayName: string
+): Promise<{ messageId: number; channelId: string } | null> {
+  try {
+    const msg = await telegram.sendMessage(proofChannel, buildProofMessage(w, displayName, "pending"), { parse_mode: "HTML" });
+    return { messageId: msg.message_id, channelId: proofChannel };
+  } catch (err) {
+    logger.warn({ err, proofChannel }, "Impossible d'envoyer la preuve de retrait");
+    return null;
+  }
+}
+
+async function editWithdrawalProof(
+  telegram: Telegraf["telegram"],
+  proofChannelId: string,
+  proofMessageId: string,
+  w: { id: number; amount: number; paymentMethod: string; requestedAt: Date },
+  displayName: string,
+  status: "approved" | "rejected",
+  extra?: { approvedAt?: Date; reason?: string }
+): Promise<void> {
+  try {
+    await telegram.editMessageText(
+      proofChannelId,
+      parseInt(proofMessageId, 10),
+      undefined,
+      buildProofMessage(w, displayName, status, extra),
+      { parse_mode: "HTML" }
+    );
+  } catch (err) {
+    logger.warn({ err, proofChannelId, proofMessageId }, "Impossible de modifier la preuve de retrait");
+  }
 }
 
 // ─── Broadcast engine ─────────────────────────────────────────────────────────
 async function getBroadcastTargets(filter: "all" | "active"): Promise<string[]> {
-  let query = db.select({ telegramId: usersTable.telegramId }).from(usersTable)
-    .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false)));
   if (filter === "active") {
-    const cutoff = new Date(Date.now() - ACTIVE_USER_DAYS * 24 * 60 * 60 * 1000);
-    // @ts-ignore — drizzle where chain
-    query = db.select({ telegramId: usersTable.telegramId }).from(usersTable)
+    const cutoff = new Date(Date.now() - ACTIVE_USER_DAYS * 24 * 3_600_000);
+    const rows = await db.select({ telegramId: usersTable.telegramId }).from(usersTable)
       .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false), gt(usersTable.createdAt, cutoff)));
+    return rows.map((r) => r.telegramId);
   }
-  const rows = await query;
+  const rows = await db.select({ telegramId: usersTable.telegramId }).from(usersTable)
+    .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false)));
   return rows.map((r) => r.telegramId);
 }
 
 async function executeBroadcast(telegram: Telegraf["telegram"], broadcastId: number): Promise<void> {
   const [bc] = await db.select().from(broadcastsTable).where(eq(broadcastsTable.id, broadcastId));
   if (!bc || bc.status !== "scheduled") return;
-
   const targets = await getBroadcastTargets(bc.targetFilter as "all" | "active");
-  await db.update(broadcastsTable).set({
-    status: "sending", totalTargets: targets.length, startedAt: new Date(),
-  }).where(eq(broadcastsTable.id, broadcastId));
-
+  await db.update(broadcastsTable).set({ status: "sending", totalTargets: targets.length, startedAt: new Date() }).where(eq(broadcastsTable.id, broadcastId));
   let sent = 0; let failed = 0; let blocked = 0;
-
   for (const userId of targets) {
     try {
-      if (bc.type === "text") {
-        await telegram.sendMessage(userId, bc.content, { parse_mode: "HTML" });
-      } else if (bc.type === "photo" && bc.mediaFileId) {
-        await telegram.sendPhoto(userId, bc.mediaFileId, { caption: bc.content, parse_mode: "HTML" });
-      } else if (bc.type === "video" && bc.mediaFileId) {
-        await telegram.sendVideo(userId, bc.mediaFileId, { caption: bc.content, parse_mode: "HTML" });
-      }
+      if (bc.type === "text") await telegram.sendMessage(userId, bc.content, { parse_mode: "HTML" });
+      else if (bc.type === "photo" && bc.mediaFileId) await telegram.sendPhoto(userId, bc.mediaFileId, { caption: bc.content, parse_mode: "HTML" });
+      else if (bc.type === "video" && bc.mediaFileId) await telegram.sendVideo(userId, bc.mediaFileId, { caption: bc.content, parse_mode: "HTML" });
       sent++;
     } catch (err: any) {
       const msg = String(err?.message ?? "");
-      if (msg.includes("blocked") || msg.includes("deactivated") || msg.includes("chat not found") || msg.includes("Forbidden")) {
-        blocked++;
-      } else {
-        failed++;
-      }
+      if (msg.includes("blocked") || msg.includes("deactivated") || msg.includes("chat not found") || msg.includes("Forbidden")) blocked++;
+      else failed++;
     }
     await new Promise((r) => setTimeout(r, BROADCAST_DELAY_MS));
   }
-
-  await db.update(broadcastsTable).set({
-    status: "completed", sentCount: sent, failedCount: failed, blockedCount: blocked, completedAt: new Date(),
-  }).where(eq(broadcastsTable.id, broadcastId));
-
+  await db.update(broadcastsTable).set({ status: "completed", sentCount: sent, failedCount: failed, blockedCount: blocked, completedAt: new Date() }).where(eq(broadcastsTable.id, broadcastId));
   logger.info({ broadcastId, sent, failed, blocked }, "Diffusion terminée");
 }
 
 async function processScheduledBroadcasts(telegram: Telegraf["telegram"]): Promise<void> {
   const now = new Date();
-  const due = await db.select().from(broadcastsTable)
-    .where(and(eq(broadcastsTable.status, "scheduled"), lt(broadcastsTable.scheduledAt, now)));
+  const due = await db.select().from(broadcastsTable).where(and(eq(broadcastsTable.status, "scheduled"), lt(broadcastsTable.scheduledAt, now)));
   for (const bc of due) {
-    logger.info({ broadcastId: bc.id }, "Démarrage diffusion planifiée");
-    executeBroadcast(telegram, bc.id).catch((err) => logger.error({ err, broadcastId: bc.id }, "Erreur diffusion"));
+    executeBroadcast(telegram, bc.id).catch((err) => logger.error({ err, broadcastId: bc.id }, "Erreur diffusion planifiée"));
   }
 }
 
-// ─── Bot factory ─────────────────────────────────────────────────────────────
+// ─── Bot factory ──────────────────────────────────────────────────────────────
 export function createBot(token: string): Telegraf {
   const bot = new Telegraf(token);
 
-  // ─── Global maintenance mode middleware ───────────────────────────────────
+  // ─── Maintenance middleware ───────────────────────────────────────────────
   bot.use(async (ctx, next) => {
     const telegramId = String(ctx.from?.id ?? "");
-    const isAdminUser = adminIds().includes(telegramId);
-    if (isAdminUser) return next();
+    if (adminIds().includes(telegramId)) return next();
     const settings = await getSettings();
-    if (settings.maintenanceMode) {
-      await ctx.reply(settings.maintenanceMessage);
-      return;
-    }
+    if (settings.maintenanceMode) { await ctx.reply(settings.maintenanceMessage); return; }
     return next();
   });
 
   // ─── Scheduled broadcast processor ───────────────────────────────────────
   setInterval(() => {
-    processScheduledBroadcasts(bot.telegram).catch((err) =>
-      logger.error({ err }, "Erreur vérification diffusions planifiées")
-    );
+    processScheduledBroadcasts(bot.telegram).catch((err) => logger.error({ err }, "Erreur vérification diffusions"));
   }, 60_000);
 
-  // ─── Callbacks ───────────────────────────────────────────────────────────
+  // =========================================================================
+  // CALLBACK ACTIONS
+  // =========================================================================
+
+  // ─── verify_membership — onboarding flow ─────────────────────────────────
   bot.action("verify_membership", async (ctx) => {
-    await ctx.answerCbQuery();
+    await ctx.answerCbQuery("⏳ Vérification en cours...");
     const telegramId = String(ctx.from?.id ?? "");
+    const firstName = ctx.from?.first_name ?? "ami(e)";
     const missing = await getMissingChannels(ctx.telegram, telegramId);
-    if (missing.length === 0) {
-      await ctx.reply("✅ Parfait ! Vous êtes maintenant membre de tous les canaux. Bienvenue ! 🎉", mainMenu());
+
+    if (missing.length > 0) {
+      const list = missing.map((ch) => `❌ ${ch.channelName}`).join("\n");
+      await ctx.reply(
+        `⚠️ <b>Adhésion incomplète</b>\n\nVous n'avez pas encore rejoint :\n\n${list}\n\nRejoignez ces canaux puis appuyez à nouveau sur ✅ Vérifier.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    // All channels verified ✅
+    const [user] = await db.select().from(usersTable).where(eq(usersTable.telegramId, telegramId));
+    if (!user) { await ctx.reply("✅ Parfait ! Tapez /start pour continuer.", mainMenu()); return; }
+
+    const channels = await getActiveChannels();
+    const checklist = channels.map((ch) => `✅ <b>${ch.channelName}</b>`).join("\n");
+
+    if (!user.welcomeBonusClaimed) {
+      // Give welcome bonus
+      const [updated] = await db.update(usersTable)
+        .set({ balance: sql`${usersTable.balance} + ${WELCOME_BONUS}`, welcomeBonusClaimed: true })
+        .where(eq(usersTable.telegramId, telegramId))
+        .returning();
+
+      await ctx.reply(
+        `🎉 <b>Félicitations, ${firstName} !</b>\n\n` +
+        `Vous avez rejoint tous nos canaux officiels :\n\n${checklist}\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `💰 <b>Bonus de bienvenue : +${WELCOME_BONUS} F</b>\n` +
+        `🎁 Solde actuel : <b>${(updated!.balance).toLocaleString("fr-FR")} F</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `👥 Invitez vos amis et gagnez <b>${REFERRAL_REWARD} F</b> par personne inscrite !`,
+        {
+          parse_mode: "HTML",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("🔗 Inviter des amis maintenant", "show_referral")],
+            [Markup.button.callback("🏠 Menu principal", "go_main_menu")],
+          ]),
+        }
+      );
     } else {
-      await ctx.reply(`❌ Il vous manque encore :\n${missing.map((ch) => `• ${ch.channelName}`).join("\n")}\n\nRejoignez-les puis vérifiez à nouveau.`);
+      await ctx.reply(
+        `✅ <b>Accès confirmé !</b>\n\nVous êtes bien membre de tous nos canaux :\n\n${checklist}`,
+        { parse_mode: "HTML", ...mainMenu() }
+      );
     }
   });
 
-  // Broadcast inline keyboard callbacks
+  // ─── show_referral — sharing buttons ─────────────────────────────────────
+  bot.action("show_referral", async (ctx) => {
+    await ctx.answerCbQuery();
+    const telegramId = String(ctx.from?.id ?? "");
+    const botUsername = await getBotUsername(ctx.telegram);
+    const link = `https://t.me/${botUsername}?start=${telegramId}`;
+    const text = `🚀 Rejoins Network Community et gagne de l'argent !\n💰 Bonus de bienvenue + parrainage à ${REFERRAL_REWARD} F par ami !\n\nInscris-toi maintenant :`;
+    const encodedText = encodeURIComponent(text);
+    const encodedLink = encodeURIComponent(link);
+
+    await ctx.reply(
+      `🔗 <b>Votre Lien de Parrainage</b>\n\n` +
+      `Partagez et gagnez <b>${REFERRAL_REWARD} F</b> par ami inscrit ! 💰\n\n` +
+      `<code>${link}</code>\n\n` +
+      `📣 Partagez maintenant :`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.url("📱 Partager sur Telegram", `https://t.me/share/url?url=${encodedLink}&text=${encodedText}`)],
+          [Markup.button.url("💬 Partager sur WhatsApp", `https://wa.me/?text=${encodedText}%20${encodedLink}`)],
+          [Markup.button.url("📘 Partager sur Facebook", `https://www.facebook.com/sharer/sharer.php?u=${encodedLink}`)],
+          [Markup.button.callback("🏠 Menu principal", "go_main_menu")],
+        ]),
+      }
+    );
+  });
+
+  // ─── go_main_menu ─────────────────────────────────────────────────────────
+  bot.action("go_main_menu", async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.reply("Menu principal :", mainMenu());
+  });
+
+  // ─── Broadcast callbacks ──────────────────────────────────────────────────
   bot.action(/^bc_type_(text|photo|video)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const adminId = String(ctx.from?.id ?? "");
@@ -287,7 +423,10 @@ export function createBot(token: string): Telegraf {
       photo: "🖼️ Envoyez la photo avec légende (optionnelle) :",
       video: "🎥 Envoyez la vidéo avec légende (optionnelle) :",
     };
-    await ctx.editMessageText(`📢 <b>Nouvelle diffusion — ${msgType === "text" ? "Texte" : msgType === "photo" ? "Photo" : "Vidéo"}</b>\n\n${prompts[msgType]}\n\n/annuler_diffusion pour annuler`, { parse_mode: "HTML" });
+    await ctx.editMessageText(
+      `📢 <b>Nouvelle diffusion — ${msgType === "text" ? "Texte" : msgType === "photo" ? "Photo" : "Vidéo"}</b>\n\n${prompts[msgType]}\n\n/annuler_diffusion pour annuler`,
+      { parse_mode: "HTML" }
+    );
   });
 
   bot.action(/^bc_target_(all|active)$/, async (ctx) => {
@@ -298,9 +437,9 @@ export function createBot(token: string): Telegraf {
     state.target = ctx.match[1] as "all" | "active";
     state.step = "schedule_choice";
     broadcastState.set(adminId, state);
-    const count = (await getBroadcastTargets(state.target)).length;
+    const targetCount = (await getBroadcastTargets(state.target)).length;
     await ctx.reply(
-      `👥 Cible : <b>${state.target === "all" ? "Tous les utilisateurs" : `Actifs (${ACTIVE_USER_DAYS} derniers jours)`}</b>\n📊 Destinataires estimés : <b>${count}</b>\n\nQuand envoyer ?`,
+      `👥 Cible : <b>${state.target === "all" ? "Tous les utilisateurs" : `Actifs (${ACTIVE_USER_DAYS}j)`}</b>\n📊 Destinataires : <b>${targetCount}</b>\n\nQuand envoyer ?`,
       {
         parse_mode: "HTML",
         ...Markup.inlineKeyboard([
@@ -315,11 +454,11 @@ export function createBot(token: string): Telegraf {
     await ctx.answerCbQuery();
     const adminId = String(ctx.from?.id ?? "");
     const state = broadcastState.get(adminId);
-    if (!state || !state.target) return;
+    if (!state?.target) return;
     state.scheduledAt = undefined;
     state.step = "confirm";
     broadcastState.set(adminId, state);
-    await showBroadcastConfirmation(ctx, adminId, state, false);
+    await showBroadcastConfirmation(ctx, state);
   });
 
   bot.action("bc_schedule", async (ctx) => {
@@ -329,37 +468,24 @@ export function createBot(token: string): Telegraf {
     if (!state) return;
     state.step = "schedule_time";
     broadcastState.set(adminId, state);
-    await ctx.reply(
-      `⏰ <b>Planifier la diffusion</b>\n\nEntrez la date et l'heure au format :\n<code>JJ/MM/AAAA HH:MM</code>\n\nEx : <code>25/12/2025 14:30</code>`,
-      { parse_mode: "HTML" }
-    );
+    await ctx.reply(`⏰ <b>Planifier</b>\n\nFormat : <code>JJ/MM/AAAA HH:MM</code>\nEx : <code>25/12/2025 14:30</code>`, { parse_mode: "HTML" });
   });
 
   bot.action("bc_confirm", async (ctx) => {
     await ctx.answerCbQuery("⏳ Diffusion en cours...");
     const adminId = String(ctx.from?.id ?? "");
     const state = broadcastState.get(adminId);
-    if (!state || !state.content || !state.msgType || !state.target) return;
+    if (!state?.content || !state.msgType || !state.target) return;
     broadcastState.delete(adminId);
-
     const [bc] = await db.insert(broadcastsTable).values({
-      type: state.msgType,
-      content: state.content,
-      mediaFileId: state.mediaFileId ?? null,
-      status: "scheduled",
-      targetFilter: state.target,
-      scheduledAt: state.scheduledAt ?? null,
-      createdBy: adminId,
+      type: state.msgType, content: state.content, mediaFileId: state.mediaFileId ?? null,
+      status: "scheduled", targetFilter: state.target, scheduledAt: state.scheduledAt ?? null, createdBy: adminId,
     }).returning();
-
     if (!state.scheduledAt) {
-      await ctx.editMessageText(`⏳ <b>Diffusion démarrée !</b>\n🆔 #${bc!.id}\n\nEnvoi en cours... Consultez /admin_diffusions pour les stats.`, { parse_mode: "HTML" });
+      await ctx.editMessageText(`⏳ <b>Diffusion démarrée !</b>\n🆔 #${bc!.id}\n\nConsultez /admin_diffusions pour les stats.`, { parse_mode: "HTML" });
       executeBroadcast(bot.telegram, bc!.id).catch((err) => logger.error({ err, broadcastId: bc!.id }, "Erreur diffusion"));
     } else {
-      await ctx.editMessageText(
-        `✅ <b>Diffusion planifiée !</b>\n🆔 #${bc!.id}\n📅 Heure : <b>${state.scheduledAt.toLocaleString("fr-FR")}</b>\n\nConsultez /admin_diffusions pour les détails.`,
-        { parse_mode: "HTML" }
-      );
+      await ctx.editMessageText(`✅ <b>Diffusion planifiée !</b>\n🆔 #${bc!.id}\n📅 ${state.scheduledAt.toLocaleString("fr-FR")}`, { parse_mode: "HTML" });
     }
   });
 
@@ -368,6 +494,37 @@ export function createBot(token: string): Telegraf {
     broadcastState.delete(String(ctx.from?.id ?? ""));
     await ctx.editMessageText("❌ Diffusion annulée.");
   });
+
+  // Task notification callbacks
+  bot.action(/^notify_task_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery("⏳ Notification en cours...");
+    const taskId = parseInt(ctx.match[1] ?? "", 10);
+    if (isNaN(taskId)) return;
+    const [task] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId));
+    if (!task) return;
+    await ctx.editMessageText(`⏳ Envoi pour <b>"${task.title}"</b>...`, { parse_mode: "HTML" });
+    const targets = await getBroadcastTargets("all");
+    let sent = 0;
+    for (const userId of targets) {
+      try {
+        await ctx.telegram.sendMessage(userId,
+          `📋 <b>Nouvelle Tâche !</b>\n\n✨ <b>${task.title}</b>\n📝 ${task.description}\n💰 +<b>${task.rewardAmount} F</b>\n\n➡️ /valider_${task.id}`,
+          { parse_mode: "HTML" });
+        sent++;
+      } catch { }
+      await new Promise((r) => setTimeout(r, BROADCAST_DELAY_MS));
+    }
+    await ctx.reply(`✅ Notification envoyée à <b>${sent}</b> utilisateurs.`, { parse_mode: "HTML" });
+  });
+
+  bot.action("notify_skip", async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+  });
+
+  // =========================================================================
+  // USER COMMANDS & MENUS
+  // =========================================================================
 
   // ─── /start ───────────────────────────────────────────────────────────────
   bot.start(async (ctx) => {
@@ -396,43 +553,40 @@ export function createBot(token: string): Telegraf {
           if (isFraud) {
             await db.update(usersTable).set({ flaggedForFraud: true }).where(eq(usersTable.telegramId, referredByTelegramId));
           } else {
-            await db.insert(referralsTable).values({
-              referrerId: referredByTelegramId, referredId: telegramId, rewardAmount: REFERRAL_REWARD,
-            }).onConflictDoNothing();
+            await db.insert(referralsTable).values({ referrerId: referredByTelegramId, referredId: telegramId, rewardAmount: REFERRAL_REWARD }).onConflictDoNothing();
             await db.update(usersTable)
               .set({ balance: sql`${usersTable.balance} + ${REFERRAL_REWARD}`, referralCount: sql`${usersTable.referralCount} + 1` })
               .where(eq(usersTable.telegramId, referredByTelegramId));
             try {
               await ctx.telegram.sendMessage(referredByTelegramId,
-                `🎉 <b>${firstName ?? "Un nouvel utilisateur"}</b> a rejoint via votre lien !\n+<b>${REFERRAL_REWARD} F</b> 💰`,
+                `🎉 <b>${firstName ?? "Un ami"}</b> a rejoint via votre lien !\n<b>+${REFERRAL_REWARD} F</b> ajoutés à votre solde 💰`,
                 { parse_mode: "HTML" });
             } catch { }
           }
         }
       }
 
-      const missing = await getMissingChannels(ctx.telegram, telegramId);
-      if (missing.length > 0) {
-        const channelList = missing.map((ch) => `• ${ch.channelName}`).join("\n");
+      // Check required channels
+      const channels = await getActiveChannels();
+      if (channels.length > 0) {
+        const channelList = channels.map((ch) => `📢 ${ch.channelName}`).join("\n");
         await ctx.reply(
-          `👋 Bienvenue, <b>${firstName ?? "ami(e)"}</b> !\n\nPour accéder au bot, rejoignez ${missing.length === 1 ? "ce canal" : "ces canaux"} :\n\n${channelList}`,
+          `👋 Bienvenue, <b>${firstName ?? "ami(e)"}</b> ! 🎉\n\n` +
+          `Pour accéder au bot, rejoignez nos canaux officiels :\n\n${channelList}\n\n` +
+          `Une fois membre, cliquez sur ✅ Vérifier pour recevoir votre <b>bonus de bienvenue de ${WELCOME_BONUS} F</b> !`,
           {
             parse_mode: "HTML",
             ...Markup.inlineKeyboard([
-              ...missing.map((ch) => [Markup.button.url(`📢 Rejoindre ${ch.channelName}`, `https://t.me/${ch.channelId.replace("@", "")}`)]),
+              ...channels.map((ch) => [Markup.button.url(`📢 ${ch.channelName}`, `https://t.me/${ch.channelId.replace("@", "")}`)]),
               [Markup.button.callback("✅ Vérifier mon adhésion", "verify_membership")],
             ]),
           }
         );
       } else {
-        const settings = await getSettings();
-        const welcomeMsg = settings.welcomeMessage ??
-          `👋 Bienvenue, <b>${firstName ?? "ami(e)"}</b> !\n\n🎁 Complétez des tâches et invitez des amis !\n💰 Parrainage = <b>${REFERRAL_REWARD} F</b> | 🎁 Bonus = <b>${DAILY_BONUS} F</b>/jour`;
-        const finalMsg = welcomeMsg
-          .replace("{prenom}", firstName ?? "ami(e)")
-          .replace("{parrainage}", String(REFERRAL_REWARD))
-          .replace("{bonus}", String(DAILY_BONUS));
-        await ctx.reply(finalMsg + (referredByTelegramId ? "\n\n✨ Vous avez été parrainé(e) !" : ""), { parse_mode: "HTML", ...mainMenu() });
+        await ctx.reply(
+          `👋 Bienvenue, <b>${firstName ?? "ami(e)"}</b> !\n\n🎁 Gagnez de l'argent en complétant des tâches et en parrainant vos amis !\n💰 Parrainage : <b>${REFERRAL_REWARD} F</b> | Bonus quotidien : <b>${DAILY_BONUS} F</b>`,
+          { parse_mode: "HTML", ...mainMenu() }
+        );
       }
     } else {
       await db.update(usersTable).set({ username, firstName, lastName }).where(eq(usersTable.telegramId, telegramId));
@@ -450,26 +604,39 @@ export function createBot(token: string): Telegraf {
     const [pw] = await db.select({ c: count() }).from(withdrawalsTable)
       .where(and(eq(withdrawalsTable.telegramId, telegramId), eq(withdrawalsTable.status, "pending")));
     await ctx.reply(
-      `💰 <b>Mon Solde</b>\n\n💵 Disponible : <b>${user.balance.toLocaleString("fr-FR")} F</b>\n👥 Parrainages : <b>${user.referralCount}</b>\n✅ Tâches : <b>${user.tasksCompletedCount}</b>` +
+      `💰 <b>Mon Solde</b>\n\n` +
+      `💵 Disponible : <b>${user.balance.toLocaleString("fr-FR")} F</b>\n` +
+      `👥 Parrainages : <b>${user.referralCount}</b>\n` +
+      `✅ Tâches complétées : <b>${user.tasksCompletedCount}</b>` +
       ((pw?.c ?? 0) > 0 ? `\n⏳ Retrait en attente : <b>${pw!.c}</b>` : "") +
       `\n\n💡 Retrait minimum : <b>${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F</b>`,
       { parse_mode: "HTML", ...mainMenu() }
     );
   });
 
-  // ─── Mon Lien ─────────────────────────────────────────────────────────────
+  // ─── Mon Lien de Parrainage ───────────────────────────────────────────────
   bot.hears("🔗 Mon Lien de Parrainage", async (ctx) => {
     if (!(await requireChannels(ctx))) return;
     const telegramId = String(ctx.from.id);
     const user = await getOrFailUser(ctx, telegramId);
     if (!user) return;
-    let botUsername = "bot";
-    try { const me = await ctx.telegram.getMe(); botUsername = me.username ?? "bot"; } catch { }
+    const botUsername = await getBotUsername(ctx.telegram);
     const link = `https://t.me/${botUsername}?start=${telegramId}`;
+    const text = `🚀 Rejoins Network Community et gagne de l'argent !\n💰 Bonus de bienvenue + ${REFERRAL_REWARD} F par parrainage !\n\nInscris-toi :`;
+    const encodedText = encodeURIComponent(text);
+    const encodedLink = encodeURIComponent(link);
     const refs = await db.select().from(referralsTable).where(eq(referralsTable.referrerId, telegramId));
     await ctx.reply(
-      `🔗 <b>Mon Lien de Parrainage</b>\n\nGagnez <b>${REFERRAL_REWARD} F</b> par ami inscrit !\n\n<code>${link}</code>\n\n👥 Parrainages : <b>${refs.length}</b>\n💰 Gains : <b>${(refs.length * REFERRAL_REWARD).toLocaleString("fr-FR")} F</b>`,
-      { parse_mode: "HTML", ...mainMenu() }
+      `🔗 <b>Mon Lien de Parrainage</b>\n\nGagnez <b>${REFERRAL_REWARD} F</b> par ami inscrit !\n\n<code>${link}</code>\n\n` +
+      `👥 Parrainages : <b>${refs.length}</b>\n💰 Gains totaux : <b>${(refs.length * REFERRAL_REWARD).toLocaleString("fr-FR")} F</b>\n\n📣 Partagez maintenant :`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.url("📱 Telegram", `https://t.me/share/url?url=${encodedLink}&text=${encodedText}`)],
+          [Markup.button.url("💬 WhatsApp", `https://wa.me/?text=${encodedText}%20${encodedLink}`)],
+          [Markup.button.url("📘 Facebook", `https://www.facebook.com/sharer/sharer.php?u=${encodedLink}`)],
+        ]),
+      }
     );
   });
 
@@ -485,10 +652,10 @@ export function createBot(token: string): Telegraf {
     if (tasks.length === 0) { await ctx.reply("📋 Aucune tâche disponible.", mainMenu()); return; }
     const lines = tasks.map((t) => {
       const done = completedIds.has(t.id);
-      return `${done ? "✅" : "🔲"} <b>${t.title}</b> — <b>+${t.rewardAmount} F</b>\n   📝 ${t.description}\n   ${done ? "<i>Terminée</i>" : `➡️ /valider_${t.id}`}`;
+      return `${done ? "✅" : "🔲"} <b>${t.title}</b> — <b>+${t.rewardAmount} F</b>\n   📝 ${t.description}\n   ${done ? "<i>Terminée ✓</i>" : `➡️ /valider_${t.id}`}`;
     });
     await ctx.reply(
-      `📋 <b>Mes Tâches</b>\n\nProgression : <b>${completedIds.size}/${tasks.length}</b>\n\n${lines.join("\n\n")}\n\n💡 Complétez ≥${MIN_TASKS_FOR_BONUS} tâche pour débloquer le bonus.`,
+      `📋 <b>Mes Tâches</b>\n\nProgression : <b>${completedIds.size}/${tasks.length}</b>\n\n${lines.join("\n\n")}\n\n💡 Complétez ≥${MIN_TASKS_FOR_BONUS} tâche pour débloquer le bonus quotidien.`,
       { parse_mode: "HTML", ...mainMenu() }
     );
   });
@@ -506,7 +673,7 @@ export function createBot(token: string): Telegraf {
     const lines = top.map((u, i) => {
       const medal = medals[i] ?? `${i + 1}.`;
       const name = u.username ? `@${u.username}` : (u.firstName ?? "Utilisateur");
-      return `${medal} ${name}${u.telegramId === telegramId ? " 👈" : ""}\n   👥 ${u.referralCount} filleuls · 💰 ${u.balance.toLocaleString("fr-FR")} F`;
+      return `${medal} ${name}${u.telegramId === telegramId ? " 👈 <i>vous</i>" : ""}\n   👥 ${u.referralCount} filleuls · 💰 ${u.balance.toLocaleString("fr-FR")} F`;
     });
     await ctx.reply(`🏆 <b>Top Parrains</b>\n\n${lines.join("\n\n")}`, { parse_mode: "HTML", ...mainMenu() });
   });
@@ -519,20 +686,20 @@ export function createBot(token: string): Telegraf {
     if (!user) return;
     if (user.tasksCompletedCount < MIN_TASKS_FOR_BONUS) {
       await ctx.reply(
-        `🎁 <b>Bonus Quotidien</b>\n\n❌ Complétez au moins <b>${MIN_TASKS_FOR_BONUS} tâche(s)</b> d'abord.\nTâches : <b>${user.tasksCompletedCount}/${MIN_TASKS_FOR_BONUS}</b>`,
+        `🎁 <b>Bonus Quotidien</b>\n\n❌ Complétez au moins <b>${MIN_TASKS_FOR_BONUS} tâche(s)</b> d'abord.\nTâches : <b>${user.tasksCompletedCount}/${MIN_TASKS_FOR_BONUS}</b>\n\n📋 Allez dans Mes Tâches !`,
         { parse_mode: "HTML", ...mainMenu() }
       );
       return;
     }
     const now = new Date();
     if (user.lastDailyBonusAt) {
-      const hoursSince = (now.getTime() - user.lastDailyBonusAt.getTime()) / (1000 * 60 * 60);
+      const hoursSince = (now.getTime() - user.lastDailyBonusAt.getTime()) / 3_600_000;
       if (hoursSince < DAILY_BONUS_HOURS) {
         const next = new Date(user.lastDailyBonusAt.getTime() + DAILY_BONUS_HOURS * 3_600_000);
         const diff = next.getTime() - now.getTime();
         const h = Math.floor(diff / 3_600_000);
         const m = Math.floor((diff % 3_600_000) / 60_000);
-        await ctx.reply(`🎁 <b>Bonus Quotidien</b>\n\n⏳ Déjà réclamé. Prochain bonus dans : <b>${h}h ${m}min</b>`, { parse_mode: "HTML", ...mainMenu() });
+        await ctx.reply(`🎁 <b>Bonus Quotidien</b>\n\n⏳ Déjà réclamé. Prochain bonus dans : <b>${h}h ${m}min</b>\n💰 Solde : <b>${user.balance.toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML", ...mainMenu() });
         return;
       }
     }
@@ -540,7 +707,7 @@ export function createBot(token: string): Telegraf {
       .set({ balance: sql`${usersTable.balance} + ${DAILY_BONUS}`, lastDailyBonusAt: now })
       .where(eq(usersTable.telegramId, telegramId)).returning();
     await ctx.reply(
-      `🎁 <b>Bonus Réclamé !</b>\n\n✅ <b>+${DAILY_BONUS} F</b>\n💰 Nouveau solde : <b>${updated!.balance.toLocaleString("fr-FR")} F</b>\n\nRevenez demain ⏰`,
+      `🎁 <b>Bonus Quotidien Réclamé !</b>\n\n✅ <b>+${DAILY_BONUS} F</b> ajoutés !\n💰 Nouveau solde : <b>${updated!.balance.toLocaleString("fr-FR")} F</b>\n\n⏰ Revenez demain !`,
       { parse_mode: "HTML", ...mainMenu() }
     );
   });
@@ -552,14 +719,17 @@ export function createBot(token: string): Telegraf {
     const user = await getOrFailUser(ctx, telegramId);
     if (!user) return;
     if (user.balance < MIN_WITHDRAWAL) {
-      await ctx.reply(`💸 <b>Retrait</b>\n\n❌ Solde insuffisant.\n💰 Solde : <b>${user.balance.toLocaleString("fr-FR")} F</b>\n📊 Minimum : <b>${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML", ...mainMenu() });
+      await ctx.reply(
+        `💸 <b>Retrait</b>\n\n❌ Solde insuffisant.\n💰 Solde : <b>${user.balance.toLocaleString("fr-FR")} F</b>\n📊 Minimum : <b>${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F</b>`,
+        { parse_mode: "HTML", ...mainMenu() }
+      );
       return;
     }
     const pending = await db.select().from(withdrawalsTable).where(and(eq(withdrawalsTable.telegramId, telegramId), eq(withdrawalsTable.status, "pending")));
-    if (pending.length > 0) { await ctx.reply("⏳ Vous avez déjà un retrait en attente.", mainMenu()); return; }
+    if (pending.length > 0) { await ctx.reply("⏳ Vous avez déjà un retrait en attente d'approbation.", mainMenu()); return; }
     convState.set(telegramId, { step: "awaiting_amount" });
     await ctx.reply(
-      `💸 <b>Retrait</b>\n\n💰 Solde : <b>${user.balance.toLocaleString("fr-FR")} F</b>\nMinimum : <b>${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F</b>\n\nCombien souhaitez-vous retirer ?`,
+      `💸 <b>Demande de Retrait</b>\n\n💰 Solde disponible : <b>${user.balance.toLocaleString("fr-FR")} F</b>\n📊 Minimum : <b>${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F</b>\n\nCombien souhaitez-vous retirer ?`,
       { parse_mode: "HTML", ...Markup.keyboard([["❌ Annuler"]]).resize() }
     );
   });
@@ -568,9 +738,18 @@ export function createBot(token: string): Telegraf {
   bot.hears("ℹ️ Aide", async (ctx) => {
     if (!(await requireChannels(ctx))) return;
     const channels = await getActiveChannels();
-    const channelLine = channels.length > 0 ? `\n\n<b>📢 Canaux obligatoires :</b>\n${channels.map((c) => `• ${c.channelName}`).join("\n")}` : "";
+    const channelLine = channels.length > 0
+      ? `\n\n<b>📢 Canaux officiels :</b>\n${channels.map((c) => `• ${c.channelName}`).join("\n")}`
+      : "";
     await ctx.reply(
-      `ℹ️ <b>Comment ça marche ?</b>\n\n💰 <b>Mon Solde</b> — voir vos fonds\n🔗 <b>Mon Lien</b> — parrainage (+${REFERRAL_REWARD} F/ami)\n📋 <b>Mes Tâches</b> — missions à compléter\n🏆 <b>Classement</b> — top parrains\n🎁 <b>Bonus</b> — ${DAILY_BONUS} F/jour\n💸 <b>Retrait</b> — min ${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F${channelLine}`,
+      `ℹ️ <b>Guide d'utilisation</b>\n\n` +
+      `💰 <b>Mon Solde</b> — voir vos fonds\n` +
+      `🔗 <b>Mon Lien</b> — parrainage (+${REFERRAL_REWARD} F/ami)\n` +
+      `📋 <b>Mes Tâches</b> — missions à compléter\n` +
+      `🏆 <b>Classement</b> — top parrains\n` +
+      `🎁 <b>Bonus</b> — ${DAILY_BONUS} F/jour (après 1 tâche)\n` +
+      `💸 <b>Retrait</b> — minimum ${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F` +
+      `${channelLine}`,
       { parse_mode: "HTML", ...mainMenu() }
     );
   });
@@ -592,7 +771,9 @@ export function createBot(token: string): Telegraf {
     const [task] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId));
     if (!task || !task.isActive) { await ctx.reply("❌ Tâche introuvable ou inactive."); return; }
     const existing = await db.select().from(userTasksTable).where(eq(userTasksTable.telegramId, telegramId));
-    if (existing.some((t) => t.taskId === taskId)) { await ctx.reply(`✅ Vous avez déjà complété <b>"${task.title}"</b>.`, { parse_mode: "HTML" }); return; }
+    if (existing.some((t) => t.taskId === taskId)) {
+      await ctx.reply(`✅ Vous avez déjà complété <b>"${task.title}"</b>.`, { parse_mode: "HTML" }); return;
+    }
     await db.insert(userTasksTable).values({ telegramId, taskId, rewardAmount: task.rewardAmount });
     const [updated] = await db.update(usersTable)
       .set({ balance: sql`${usersTable.balance} + ${task.rewardAmount}`, tasksCompletedCount: sql`${usersTable.tasksCompletedCount} + 1` })
@@ -606,13 +787,14 @@ export function createBot(token: string): Telegraf {
   // ─── /annuler_diffusion ───────────────────────────────────────────────────
   bot.command("annuler_diffusion", async (ctx) => {
     const adminId = String(ctx.from.id);
-    if (broadcastState.has(adminId)) {
-      broadcastState.delete(adminId);
-      await ctx.reply("❌ Diffusion annulée.", mainMenu());
-    }
+    broadcastState.delete(adminId);
+    adminSettingState.delete(adminId);
+    await ctx.reply("❌ Action annulée.", mainMenu());
   });
 
-  // ─── Conversation handler ─────────────────────────────────────────────────
+  // =========================================================================
+  // TEXT / MEDIA CONVERSATION HANDLER
+  // =========================================================================
   bot.on("text", async (ctx) => {
     const telegramId = String(ctx.from.id);
     const text = ctx.message.text.trim();
@@ -630,16 +812,14 @@ export function createBot(token: string): Telegraf {
       }
       if (bcState?.step === "schedule_time") {
         const parsed = parseFrDate(text);
-        if (!parsed) { await ctx.reply("❌ Format invalide. Utilisez : JJ/MM/AAAA HH:MM\nEx : 25/12/2025 14:30"); return; }
+        if (!parsed) { await ctx.reply("❌ Format invalide. Exemple : <code>25/12/2025 14:30</code>", { parse_mode: "HTML" }); return; }
         if (parsed <= new Date()) { await ctx.reply("❌ La date doit être dans le futur."); return; }
         bcState.scheduledAt = parsed;
         bcState.step = "confirm";
         broadcastState.set(telegramId, bcState);
-        await showBroadcastConfirmation(ctx, telegramId, bcState, true);
+        await showBroadcastConfirmation(ctx, bcState);
         return;
       }
-
-      // Admin settings conversation
       const settingStep = adminSettingState.get(telegramId);
       if (settingStep?.step === "welcome_content") {
         adminSettingState.delete(telegramId);
@@ -664,54 +844,82 @@ export function createBot(token: string): Telegraf {
 
     if (state.step === "awaiting_amount") {
       const amount = parseInt(text.replace(/[\s\u00a0,\.]/g, ""), 10);
-      if (isNaN(amount) || amount < MIN_WITHDRAWAL) { await ctx.reply(`❌ Minimum : <b>${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML" }); return; }
+      if (isNaN(amount) || amount < MIN_WITHDRAWAL) {
+        await ctx.reply(`❌ Minimum : <b>${MIN_WITHDRAWAL.toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML" }); return;
+      }
       const [user] = await db.select().from(usersTable).where(eq(usersTable.telegramId, telegramId));
-      if (!user || amount > user.balance) { await ctx.reply(`❌ Solde insuffisant : <b>${(user?.balance ?? 0).toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML" }); convState.delete(telegramId); await ctx.reply("Annulé.", mainMenu()); return; }
+      if (!user || amount > user.balance) {
+        await ctx.reply(`❌ Solde insuffisant : <b>${(user?.balance ?? 0).toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML" });
+        convState.delete(telegramId); await ctx.reply("Annulé.", mainMenu()); return;
+      }
       state.step = "awaiting_method"; state.amount = amount;
       convState.set(telegramId, state);
-      await ctx.reply("💳 Choisissez votre méthode :", {
+      await ctx.reply("💳 Choisissez votre méthode de paiement :", {
         ...Markup.keyboard([["📱 Mobile Money", "🏦 Virement Bancaire"], ["💰 PayPal", "🔐 Crypto (USDT/BTC)"], ["❌ Annuler"]]).resize(),
       });
       return;
     }
+
     if (state.step === "awaiting_method") {
-      if (!["📱 Mobile Money", "🏦 Virement Bancaire", "💰 PayPal", "🔐 Crypto (USDT/BTC)"].includes(text)) { await ctx.reply("❌ Choisissez une option."); return; }
+      const valid = ["📱 Mobile Money", "🏦 Virement Bancaire", "💰 PayPal", "🔐 Crypto (USDT/BTC)"];
+      if (!valid.includes(text)) { await ctx.reply("❌ Choisissez une option du clavier."); return; }
       state.step = "awaiting_details"; state.method = text;
       convState.set(telegramId, state);
       const prompts: Record<string, string> = {
-        "📱 Mobile Money": "Votre numéro Mobile Money :",
+        "📱 Mobile Money": "Votre numéro Mobile Money (avec indicatif pays) :",
         "🏦 Virement Bancaire": "IBAN + Nom du titulaire :",
         "💰 PayPal": "Adresse e-mail PayPal :",
-        "🔐 Crypto (USDT/BTC)": "Adresse de wallet (précisez réseau ex: TRC20) :",
+        "🔐 Crypto (USDT/BTC)": "Adresse de wallet (précisez le réseau, ex: TRC20) :",
       };
-      await ctx.reply(`📝 ${prompts[text] ?? "Vos coordonnées :"}`, Markup.keyboard([["❌ Annuler"]]).resize());
+      await ctx.reply(`📝 <b>${prompts[text] ?? "Vos coordonnées :"}</b>`, { parse_mode: "HTML", ...Markup.keyboard([["❌ Annuler"]]).resize() });
       return;
     }
+
     if (state.step === "awaiting_details") {
       if (!state.amount || !state.method) { convState.delete(telegramId); await ctx.reply("❌ Erreur.", mainMenu()); return; }
+
       const [withdrawal] = await db.insert(withdrawalsTable).values({
         telegramId, amount: state.amount, paymentMethod: state.method, paymentDetails: text, status: "pending",
       }).returning();
-      const [updatedUser] = await db.update(usersTable).set({ balance: sql`${usersTable.balance} - ${state.amount}` }).where(eq(usersTable.telegramId, telegramId)).returning();
-      const savedAmount = state.amount; const savedMethod = state.method;
+      const [updatedUser] = await db.update(usersTable)
+        .set({ balance: sql`${usersTable.balance} - ${state.amount}` })
+        .where(eq(usersTable.telegramId, telegramId)).returning();
+
+      const savedAmount = state.amount;
+      const savedMethod = state.method;
       convState.delete(telegramId);
+
+      // Confirmation to user
       await ctx.reply(
-        `✅ <b>Retrait enregistré !</b>\n\n🆔 #${withdrawal!.id}\n💰 ${savedAmount.toLocaleString("fr-FR")} F\n💳 ${savedMethod}\n⏳ En attente d'approbation\n\n💵 Solde restant : <b>${updatedUser!.balance.toLocaleString("fr-FR")} F</b>`,
+        `✅ <b>Retrait enregistré !</b>\n\n🆔 Référence : <b>#${String(withdrawal!.id).padStart(5, "0")}</b>\n💰 Montant : <b>${savedAmount.toLocaleString("fr-FR")} F</b>\n💳 Méthode : <b>${savedMethod}</b>\n⏳ Statut : <b>En attente</b>\n⏱️ Délai estimé : <b>moins de 1 heure</b>\n\n💵 Solde restant : <b>${updatedUser!.balance.toLocaleString("fr-FR")} F</b>`,
         { parse_mode: "HTML", ...mainMenu() }
       );
+
+      // Get user display name
+      const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, telegramId));
+      const displayName = u?.username ? `@${u.username}` : (u?.firstName ?? telegramId);
+
+      // Send proof message to withdrawal channel
+      const settings = await getSettings();
+      const proofResult = await sendWithdrawalProof(bot.telegram, settings.withdrawalProofChannel, withdrawal!, displayName);
+      if (proofResult) {
+        await db.update(withdrawalsTable)
+          .set({ proofMessageId: String(proofResult.messageId), proofChannelId: proofResult.channelId })
+          .where(eq(withdrawalsTable.id, withdrawal!.id));
+      }
+
+      // Notify admins
       for (const adminId of adminIds()) {
         try {
-          const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, telegramId));
-          const name = u?.username ? `@${u.username}` : u?.firstName ?? telegramId;
           await ctx.telegram.sendMessage(adminId,
-            `💸 <b>Nouveau retrait !</b>\n\n👤 ${name} (${telegramId})\n🆔 #${withdrawal!.id} — ${savedAmount.toLocaleString("fr-FR")} F\n💳 ${savedMethod}\n📝 <code>${text}</code>\n\n✅ /admin_approuver_${withdrawal!.id}\n❌ /admin_rejeter_${withdrawal!.id} <raison>`,
+            `💸 <b>Nouveau Retrait #${withdrawal!.id}</b>\n\n👤 ${displayName} (${telegramId})\n💰 ${savedAmount.toLocaleString("fr-FR")} F\n💳 ${savedMethod}\n📝 <code>${text}</code>\n\n✅ /admin_approuver_${withdrawal!.id}\n❌ /admin_rejeter_${withdrawal!.id} <raison>`,
             { parse_mode: "HTML" });
         } catch { }
       }
     }
   });
 
-  // Photo handler for broadcasts
+  // Photo/Video handlers for broadcast
   bot.on("photo", async (ctx) => {
     const adminId = String(ctx.from.id);
     if (!adminIds().includes(adminId)) return;
@@ -726,7 +934,6 @@ export function createBot(token: string): Telegraf {
     await showBroadcastPreview(ctx, bcState);
   });
 
-  // Video handler for broadcasts
   bot.on("video", async (ctx) => {
     const adminId = String(ctx.from.id);
     if (!adminIds().includes(adminId)) return;
@@ -739,29 +946,31 @@ export function createBot(token: string): Telegraf {
     await showBroadcastPreview(ctx, bcState);
   });
 
-  // ─── Admin commands ───────────────────────────────────────────────────────
+  // =========================================================================
+  // ADMIN COMMANDS
+  // =========================================================================
+
   bot.command("admin", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
     await ctx.reply(
       `🔧 <b>Panneau Administrateur</b>\n\n` +
-      `📊 /admin_stats — statistiques\n\n` +
-      `📢 <b>Diffusions</b>\n/admin_broadcast — nouvelle diffusion\n/admin_diffusions — historique\n\n` +
-      `⚙️ <b>Paramètres</b>\n/admin_parametres — paramètres bot\n/admin_bienvenue — message de bienvenue\n/admin_maintenance on/off — mode maintenance\n\n` +
-      `👥 <b>Utilisateurs</b>\n/admin_solde /admin_bonus /admin_ban /admin_unban /admin_fraude\n\n` +
-      `📋 <b>Tâches</b>\n/admin_tache /admin_taches\n\n` +
+      `📊 /admin_stats\n\n` +
+      `📢 <b>Diffusions</b>\n/admin_broadcast · /admin_diffusions\n\n` +
+      `⚙️ <b>Paramètres</b>\n/admin_parametres · /admin_bienvenue\n/admin_maintenance on/off\n\n` +
+      `👥 <b>Utilisateurs</b>\n/admin_solde · /admin_bonus · /admin_ban · /admin_unban · /admin_fraude\n\n` +
+      `📋 <b>Tâches</b>\n/admin_tache · /admin_taches\n\n` +
       `📢 <b>Canaux</b>\n/admin_canal\n\n` +
-      `💸 <b>Retraits</b>\n/admin_retraits /admin_approuver_<id> /admin_rejeter_<id>`,
+      `💸 <b>Retraits</b>\n/admin_retraits · /admin_approuver_<id> · /admin_rejeter_<id>`,
       { parse_mode: "HTML" }
     );
   });
 
-  // ─── /admin_broadcast ─────────────────────────────────────────────────────
   bot.command("admin_broadcast", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
     const adminId = String(ctx.from.id);
     broadcastState.set(adminId, { step: "type" });
     await ctx.reply(
-      `📢 <b>Nouvelle Diffusion</b>\n\nChoisissez le type de message à envoyer :`,
+      `📢 <b>Nouvelle Diffusion</b>\n\nChoisissez le type de message :`,
       {
         parse_mode: "HTML",
         ...Markup.inlineKeyboard([
@@ -772,80 +981,18 @@ export function createBot(token: string): Telegraf {
     );
   });
 
-  // ─── /admin_diffusions ────────────────────────────────────────────────────
   bot.command("admin_diffusions", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
     const broadcasts = await db.select().from(broadcastsTable).orderBy(desc(broadcastsTable.createdAt)).limit(10);
     if (broadcasts.length === 0) { await ctx.reply("📢 Aucune diffusion enregistrée."); return; }
-    const statusIcon: Record<string, string> = { scheduled: "⏰", sending: "📡", completed: "✅", failed: "❌", cancelled: "🚫" };
+    const icons: Record<string, string> = { scheduled: "⏰", sending: "📡", completed: "✅", failed: "❌", cancelled: "🚫" };
     const lines = broadcasts.map((b) => {
-      const icon = statusIcon[b.status] ?? "❓";
-      const date = b.scheduledAt ?? b.createdAt;
-      const stats = b.status === "completed"
-        ? `📤 ${b.sentCount} envoyés · ❌ ${b.failedCount} échoués · 🚫 ${b.blockedCount} bloqués`
-        : `🎯 ${b.totalTargets} cibles`;
-      return `${icon} <b>#${b.id}</b> — ${b.type} — ${date.toLocaleDateString("fr-FR")}\n   ${stats}\n   <i>${b.content.slice(0, 50)}${b.content.length > 50 ? "…" : ""}</i>`;
+      const stats = b.status === "completed" ? `📤 ${b.sentCount} · ❌ ${b.failedCount} · 🚫 ${b.blockedCount}` : `🎯 ${b.totalTargets}`;
+      return `${icons[b.status] ?? "❓"} <b>#${b.id}</b> — ${b.type} — ${(b.scheduledAt ?? b.createdAt).toLocaleDateString("fr-FR")}\n   ${stats} — <i>${b.content.slice(0, 40)}…</i>`;
     });
-    await ctx.reply(`📢 <b>Historique des Diffusions</b>\n\n${lines.join("\n\n")}`, { parse_mode: "HTML" });
+    await ctx.reply(`📢 <b>Diffusions (${broadcasts.length})</b>\n\n${lines.join("\n\n")}`, { parse_mode: "HTML" });
   });
 
-  // ─── /admin_parametres ───────────────────────────────────────────────────
-  bot.command("admin_parametres", async (ctx) => {
-    if (!(await isAdmin(ctx))) return;
-    const maintenanceMode = (await getSetting(SETTING_KEYS.MAINTENANCE_MODE)) === "true";
-    const welcomeMsg = await getSetting(SETTING_KEYS.WELCOME_MESSAGE);
-    await ctx.reply(
-      `⚙️ <b>Paramètres du Bot</b>\n\n` +
-      `🔧 Maintenance : <b>${maintenanceMode ? "✅ Activée" : "❌ Désactivée"}</b>\n` +
-      `👋 Message de bienvenue : <b>${welcomeMsg ? "Personnalisé" : "Par défaut"}</b>\n\n` +
-      `Commandes :\n` +
-      `/admin_bienvenue — éditer le message de bienvenue\n` +
-      `/admin_maintenance on — activer la maintenance\n` +
-      `/admin_maintenance off — désactiver la maintenance\n` +
-      `/admin_maintenance_msg — éditer le message de maintenance`,
-      { parse_mode: "HTML" }
-    );
-  });
-
-  // ─── /admin_bienvenue ─────────────────────────────────────────────────────
-  bot.command("admin_bienvenue", async (ctx) => {
-    if (!(await isAdmin(ctx))) return;
-    const current = await getSetting(SETTING_KEYS.WELCOME_MESSAGE);
-    adminSettingState.set(String(ctx.from.id), { step: "welcome_content" });
-    await ctx.reply(
-      `👋 <b>Message de Bienvenue</b>\n\n` +
-      (current ? `Message actuel :\n<i>${current}</i>\n\n` : "Aucun message personnalisé (défaut utilisé).\n\n") +
-      `Variables disponibles :\n• <code>{prenom}</code> — prénom de l'utilisateur\n• <code>{parrainage}</code> — récompense parrainage\n• <code>{bonus}</code> — bonus quotidien\n\n` +
-      `Rédigez le nouveau message (HTML supporté) :\n/annuler_diffusion pour annuler`,
-      { parse_mode: "HTML" }
-    );
-  });
-
-  // ─── /admin_maintenance ──────────────────────────────────────────────────
-  bot.command("admin_maintenance", async (ctx) => {
-    if (!(await isAdmin(ctx))) return;
-    const adminId = String(ctx.from.id);
-    const arg = ctx.message.text.split(" ")[1]?.toLowerCase();
-    if (arg === "on") {
-      await setSetting(SETTING_KEYS.MAINTENANCE_MODE, "true", adminId);
-      await ctx.reply("🔧 Mode maintenance <b>activé</b>.\nLes utilisateurs verront le message de maintenance.", { parse_mode: "HTML" });
-    } else if (arg === "off") {
-      await setSetting(SETTING_KEYS.MAINTENANCE_MODE, "false", adminId);
-      await ctx.reply("✅ Mode maintenance <b>désactivé</b>. Le bot est de nouveau accessible.", { parse_mode: "HTML" });
-    } else {
-      const current = (await getSetting(SETTING_KEYS.MAINTENANCE_MODE)) === "true";
-      await ctx.reply(`🔧 Maintenance actuellement : <b>${current ? "ON" : "OFF"}</b>\n\nUsage : /admin_maintenance on — activer\n/admin_maintenance off — désactiver`, { parse_mode: "HTML" });
-    }
-  });
-
-  // ─── /admin_maintenance_msg ──────────────────────────────────────────────
-  bot.command("admin_maintenance_msg", async (ctx) => {
-    if (!(await isAdmin(ctx))) return;
-    adminSettingState.set(String(ctx.from.id), { step: "maintenance_message" });
-    await ctx.reply("🔧 Rédigez le message affiché aux utilisateurs en mode maintenance :");
-  });
-
-  // ─── Admin : stats ────────────────────────────────────────────────────────
   bot.command("admin_stats", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
     const [uc] = await db.select({ c: sql<number>`count(*)::int` }).from(usersTable);
@@ -855,86 +1002,74 @@ export function createBot(token: string): Telegraf {
     const [pw] = await db.select({ c: sql<number>`count(*)::int` }).from(withdrawalsTable).where(eq(withdrawalsTable.status, "pending"));
     const [aw] = await db.select({ s: sql<number>`coalesce(sum(amount),0)::int` }).from(withdrawalsTable).where(eq(withdrawalsTable.status, "approved"));
     const [fc] = await db.select({ c: sql<number>`count(*)::int` }).from(usersTable).where(eq(usersTable.flaggedForFraud, true));
-    const [bc] = await db.select({ c: sql<number>`count(*)::int` }).from(broadcastsTable).where(eq(broadcastsTable.status, "completed"));
     const cutoff = new Date(Date.now() - ACTIVE_USER_DAYS * 24 * 3_600_000);
     const [active] = await db.select({ c: sql<number>`count(*)::int` }).from(usersTable)
       .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false), gt(usersTable.createdAt, cutoff)));
     await ctx.reply(
-      `📊 <b>Statistiques Communautaires</b>\n\n` +
-      `👥 Utilisateurs total : <b>${uc?.c ?? 0}</b>\n` +
-      `📅 Actifs (${ACTIVE_USER_DAYS}j) : <b>${active?.c ?? 0}</b>\n` +
-      `🔗 Parrainages : <b>${rc?.c ?? 0}</b>\n` +
-      `💰 Fonds distribués : <b>${(pts?.s ?? 0).toLocaleString("fr-FR")} F</b>\n` +
-      `📋 Tâches actives : <b>${tc?.c ?? 0}</b>\n` +
-      `⏳ Retraits en attente : <b>${pw?.c ?? 0}</b>\n` +
-      `✅ Total retiré : <b>${(aw?.s ?? 0).toLocaleString("fr-FR")} F</b>\n` +
-      `🚨 Comptes frauduleux : <b>${fc?.c ?? 0}</b>\n` +
-      `📢 Diffusions envoyées : <b>${bc?.c ?? 0}</b>`,
+      `📊 <b>Statistiques</b>\n\n` +
+      `👥 Utilisateurs : <b>${uc?.c ?? 0}</b>\n📅 Actifs ${ACTIVE_USER_DAYS}j : <b>${active?.c ?? 0}</b>\n` +
+      `🔗 Parrainages : <b>${rc?.c ?? 0}</b>\n💰 Fonds distribués : <b>${(pts?.s ?? 0).toLocaleString("fr-FR")} F</b>\n` +
+      `📋 Tâches actives : <b>${tc?.c ?? 0}</b>\n⏳ Retraits en attente : <b>${pw?.c ?? 0}</b>\n` +
+      `✅ Total retiré : <b>${(aw?.s ?? 0).toLocaleString("fr-FR")} F</b>\n🚨 Fraudes : <b>${fc?.c ?? 0}</b>`,
       { parse_mode: "HTML" }
     );
   });
 
-  // ─── Admin : /admin_tache (with notification) ────────────────────────────
-  bot.command("admin_tache", async (ctx) => {
+  bot.command("admin_parametres", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
-    const text = ctx.message.text.replace("/admin_tache", "").trim();
-    const parts = text.split("|");
-    const firstPart = (parts[0] ?? "").trim().split(" ");
-    const reward = parseInt(firstPart[0] ?? "", 10);
-    const title = firstPart.slice(1).join(" ").trim();
-    const description = (parts[1] ?? "").trim();
-    if (isNaN(reward) || !title || !description) {
-      await ctx.reply("Usage : /admin_tache <récompense> <titre> | <description>");
-      return;
-    }
-    const [task] = await db.insert(tasksTable).values({ title, description, rewardAmount: reward, isActive: true }).returning();
+    const maintenanceMode = (await getSetting(SETTING_KEYS.MAINTENANCE_MODE)) === "true";
+    const welcomeMsg = await getSetting(SETTING_KEYS.WELCOME_MESSAGE);
+    const proofChannel = (await getSetting(WITHDRAWAL_PROOF_CHANNEL_KEY)) ?? DEFAULT_PROOF_CHANNEL;
     await ctx.reply(
-      `✅ Tâche créée !\n🆔 ID : <b>${task!.id}</b>\n📝 <b>${title}</b>\n💰 +${reward} F\n\n🔔 Notifier tous les utilisateurs ?`,
-      {
-        parse_mode: "HTML",
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback("✅ Oui, notifier", `notify_task_${task!.id}`), Markup.button.callback("❌ Non", "notify_skip")],
-        ]),
-      }
+      `⚙️ <b>Paramètres du Bot</b>\n\n` +
+      `🔧 Maintenance : <b>${maintenanceMode ? "✅ ON" : "❌ OFF"}</b>\n` +
+      `👋 Message de bienvenue : <b>${welcomeMsg ? "Personnalisé" : "Par défaut"}</b>\n` +
+      `💸 Canal preuves : <b>${proofChannel}</b>\n\n` +
+      `/admin_bienvenue — éditer le message de bienvenue\n` +
+      `/admin_maintenance on|off — mode maintenance\n` +
+      `/admin_proof_channel @canal — changer le canal de preuves`,
+      { parse_mode: "HTML" }
     );
   });
 
-  bot.action(/^notify_task_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery("⏳ Notification en cours...");
-    const taskId = parseInt(ctx.match[1] ?? "", 10);
-    if (isNaN(taskId)) return;
-    const [task] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId));
-    if (!task) return;
-    await ctx.editMessageText(`⏳ Envoi des notifications pour la tâche <b>"${task.title}"</b>...`, { parse_mode: "HTML" });
-
-    const targets = await getBroadcastTargets("all");
-    let sent = 0;
-    for (const userId of targets) {
-      try {
-        await ctx.telegram.sendMessage(userId,
-          `📋 <b>Nouvelle Tâche Disponible !</b>\n\n✨ <b>${task.title}</b>\n📝 ${task.description}\n💰 Récompense : <b>+${task.rewardAmount} F</b>\n\n➡️ /valider_${task.id}`,
-          { parse_mode: "HTML" });
-        sent++;
-      } catch { }
-      await new Promise((r) => setTimeout(r, BROADCAST_DELAY_MS));
-    }
-    await ctx.reply(`✅ Notification envoyée à <b>${sent}</b> utilisateurs.`, { parse_mode: "HTML" });
-  });
-
-  bot.action("notify_skip", async (ctx) => {
-    await ctx.answerCbQuery();
-    await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-  });
-
-  bot.command("admin_taches", async (ctx) => {
+  bot.command("admin_bienvenue", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
-    const tasks = await db.select().from(tasksTable).orderBy(tasksTable.id);
-    if (tasks.length === 0) { await ctx.reply("Aucune tâche."); return; }
-    const lines = tasks.map((t) => `${t.isActive ? "✅" : "❌"} [${t.id}] <b>${t.title}</b> — +${t.rewardAmount} F\n   ${t.description}`);
-    await ctx.reply(`📋 <b>Toutes les Tâches</b>\n\n${lines.join("\n\n")}`, { parse_mode: "HTML" });
+    const current = await getSetting(SETTING_KEYS.WELCOME_MESSAGE);
+    adminSettingState.set(String(ctx.from.id), { step: "welcome_content" });
+    await ctx.reply(
+      `👋 <b>Message de Bienvenue</b>\n\n` +
+      (current ? `Actuel :\n<i>${current}</i>\n\n` : "Aucun message personnalisé.\n\n") +
+      `Variables : <code>{prenom}</code> <code>{parrainage}</code> <code>{bonus}</code>\n\nRédigez le nouveau message :\n/annuler_diffusion pour annuler`,
+      { parse_mode: "HTML" }
+    );
   });
 
-  // ─── Admin : utilisateurs ─────────────────────────────────────────────────
+  bot.command("admin_maintenance", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const adminId = String(ctx.from.id);
+    const arg = ctx.message.text.split(" ")[1]?.toLowerCase();
+    if (arg === "on") {
+      await setSetting(SETTING_KEYS.MAINTENANCE_MODE, "true", adminId);
+      await ctx.reply("🔧 Mode maintenance <b>activé</b>.", { parse_mode: "HTML" });
+    } else if (arg === "off") {
+      await setSetting(SETTING_KEYS.MAINTENANCE_MODE, "false", adminId);
+      await ctx.reply("✅ Mode maintenance <b>désactivé</b>.", { parse_mode: "HTML" });
+    } else {
+      const current = (await getSetting(SETTING_KEYS.MAINTENANCE_MODE)) === "true";
+      await ctx.reply(`🔧 Maintenance : <b>${current ? "ON" : "OFF"}</b>\n\nUsage : /admin_maintenance on|off`, { parse_mode: "HTML" });
+    }
+  });
+
+  bot.command("admin_proof_channel", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const channel = ctx.message.text.split(" ")[1];
+    if (!channel) { await ctx.reply("Usage : /admin_proof_channel @canal"); return; }
+    const normalized = channel.startsWith("@") ? channel : `@${channel}`;
+    await setSetting(WITHDRAWAL_PROOF_CHANNEL_KEY, normalized, String(ctx.from.id));
+    await ctx.reply(`✅ Canal de preuves mis à jour : <b>${normalized}</b>`, { parse_mode: "HTML" });
+  });
+
+  // Admin user management
   bot.command("admin_solde", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
     const parts = ctx.message.text.split(" ");
@@ -959,7 +1094,7 @@ export function createBot(token: string): Telegraf {
         `🎁 <b>Bonus Reçu !</b>\n\nUn administrateur vous a attribué <b>+${amount.toLocaleString("fr-FR")} F</b> !\n💵 Nouveau solde : <b>${updated!.balance.toLocaleString("fr-FR")} F</b>`,
         { parse_mode: "HTML" });
     } catch { }
-    await ctx.reply(`✅ Bonus <b>+${amount.toLocaleString("fr-FR")} F</b> attribué et utilisateur notifié.`, { parse_mode: "HTML" });
+    await ctx.reply(`✅ Bonus <b>+${amount.toLocaleString("fr-FR")} F</b> attribué.`, { parse_mode: "HTML" });
   });
 
   bot.command("admin_ban", async (ctx) => {
@@ -977,8 +1112,6 @@ export function createBot(token: string): Telegraf {
     if (!(await isAdmin(ctx))) return;
     const targetId = ctx.message.text.split(" ")[1];
     if (!targetId) { await ctx.reply("Usage : /admin_unban <telegramId>"); return; }
-    const [user] = await db.select().from(usersTable).where(eq(usersTable.telegramId, targetId));
-    if (!user) { await ctx.reply("❌ Introuvable."); return; }
     await db.update(usersTable).set({ isBanned: false }).where(eq(usersTable.telegramId, targetId));
     try { await ctx.telegram.sendMessage(targetId, "✅ Votre compte a été réactivé !"); } catch { }
     await ctx.reply(`✅ ${targetId} réactivé.`);
@@ -992,7 +1125,37 @@ export function createBot(token: string): Telegraf {
     await ctx.reply(`🚨 <b>Comptes Signalés (${flagged.length})</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" });
   });
 
-  // ─── Admin : canaux ───────────────────────────────────────────────────────
+  bot.command("admin_tache", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const text = ctx.message.text.replace("/admin_tache", "").trim();
+    const parts = text.split("|");
+    const firstPart = (parts[0] ?? "").trim().split(" ");
+    const reward = parseInt(firstPart[0] ?? "", 10);
+    const title = firstPart.slice(1).join(" ").trim();
+    const description = (parts[1] ?? "").trim();
+    if (isNaN(reward) || !title || !description) {
+      await ctx.reply("Usage : /admin_tache <récompense> <titre> | <description>"); return;
+    }
+    const [task] = await db.insert(tasksTable).values({ title, description, rewardAmount: reward, isActive: true }).returning();
+    await ctx.reply(
+      `✅ Tâche créée !\n🆔 <b>#${task!.id}</b> — <b>${title}</b>\n💰 +${reward} F\n\n🔔 Notifier tous les utilisateurs ?`,
+      {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback("✅ Oui, notifier", `notify_task_${task!.id}`), Markup.button.callback("❌ Non", "notify_skip")],
+        ]),
+      }
+    );
+  });
+
+  bot.command("admin_taches", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const tasks = await db.select().from(tasksTable).orderBy(tasksTable.id);
+    if (tasks.length === 0) { await ctx.reply("Aucune tâche."); return; }
+    const lines = tasks.map((t) => `${t.isActive ? "✅" : "❌"} [${t.id}] <b>${t.title}</b> — +${t.rewardAmount} F\n   ${t.description}`);
+    await ctx.reply(`📋 <b>Toutes les Tâches</b>\n\n${lines.join("\n\n")}`, { parse_mode: "HTML" });
+  });
+
   bot.command("admin_canal", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
     const adminId = String(ctx.from.id);
@@ -1002,15 +1165,13 @@ export function createBot(token: string): Telegraf {
 
     if (!sub || sub === "liste") {
       const channels = await db.select().from(requiredChannelsTable).orderBy(requiredChannelsTable.id);
-      if (channels.length === 0) {
-        await ctx.reply("📢 Aucun canal configuré.\n\nAjouter : /admin_canal ajouter @canal Nom"); return;
-      }
-      const lines = channels.map((c) => `${c.isActive ? "✅" : "❌"} [${c.id}] <b>${c.channelName}</b> — <code>${c.channelId}</code>`);
-      await ctx.reply(`📢 <b>Canaux (${channels.length})</b>\n\n${lines.join("\n")}`, { parse_mode: "HTML" }); return;
+      if (channels.length === 0) { await ctx.reply("📢 Aucun canal. Ajouter : /admin_canal ajouter @canal Nom"); return; }
+      const lines = channels.map((c) => `${c.isActive ? "✅" : "❌"} [${c.id}] <b>${c.channelName}</b>\n   <code>${c.channelId}</code>`);
+      await ctx.reply(`📢 <b>Canaux (${channels.length})</b>\n\n${lines.join("\n\n")}`, { parse_mode: "HTML" }); return;
     }
     if (sub === "ajouter") {
       const channelId = parts[1]; const channelName = parts.slice(2).join(" ").trim();
-      if (!channelId || !channelName) { await ctx.reply("Usage : /admin_canal ajouter @canal Nom du Canal"); return; }
+      if (!channelId || !channelName) { await ctx.reply("Usage : /admin_canal ajouter @canal Nom"); return; }
       const normalizedId = channelId.startsWith("@") ? channelId : `@${channelId}`;
       try { await ctx.telegram.getChat(normalizedId); } catch {
         await ctx.reply(`❌ Canal introuvable : <code>${normalizedId}</code>`, { parse_mode: "HTML" }); return;
@@ -1019,8 +1180,8 @@ export function createBot(token: string): Telegraf {
       if (existing.length > 0) {
         if (!existing[0]!.isActive) {
           await db.update(requiredChannelsTable).set({ isActive: true, channelName }).where(eq(requiredChannelsTable.channelId, normalizedId));
-          await ctx.reply(`✅ Canal <b>${channelName}</b> réactivé !`, { parse_mode: "HTML" });
-        } else { await ctx.reply(`⚠️ Canal déjà configuré.`); }
+          await ctx.reply(`✅ <b>${channelName}</b> réactivé !`, { parse_mode: "HTML" });
+        } else { await ctx.reply("⚠️ Canal déjà configuré."); }
         return;
       }
       const [ch] = await db.insert(requiredChannelsTable).values({ channelId: normalizedId, channelName, addedBy: adminId, isActive: true }).returning();
@@ -1030,9 +1191,9 @@ export function createBot(token: string): Telegraf {
       const id = parseInt(parts[1] ?? "", 10);
       if (isNaN(id)) { await ctx.reply("Usage : /admin_canal supprimer <id>"); return; }
       const [ch] = await db.select().from(requiredChannelsTable).where(eq(requiredChannelsTable.id, id));
-      if (!ch) { await ctx.reply("❌ Canal introuvable."); return; }
+      if (!ch) { await ctx.reply("❌ Introuvable."); return; }
       await db.delete(requiredChannelsTable).where(eq(requiredChannelsTable.id, id));
-      await ctx.reply(`🗑️ Canal <b>${ch.channelName}</b> supprimé.`, { parse_mode: "HTML" }); return;
+      await ctx.reply(`🗑️ <b>${ch.channelName}</b> supprimé.`, { parse_mode: "HTML" }); return;
     }
     if (sub === "desactiver") {
       const id = parseInt(parts[1] ?? "", 10);
@@ -1050,17 +1211,16 @@ export function createBot(token: string): Telegraf {
       await db.update(requiredChannelsTable).set({ isActive: true }).where(eq(requiredChannelsTable.id, id));
       await ctx.reply(`✅ <b>${ch.channelName}</b> activé.`, { parse_mode: "HTML" }); return;
     }
-    await ctx.reply("📢 Sous-commandes : liste | ajouter @canal Nom | supprimer <id> | desactiver <id> | activer <id>");
+    await ctx.reply("Sous-commandes : liste | ajouter @canal Nom | supprimer <id> | desactiver <id> | activer <id>");
   });
 
-  // ─── Admin : retraits ────────────────────────────────────────────────────
   bot.command("admin_retraits", async (ctx) => {
     if (!(await isAdmin(ctx))) return;
     const pending = await db.select().from(withdrawalsTable).where(eq(withdrawalsTable.status, "pending")).orderBy(withdrawalsTable.requestedAt).limit(20);
     if (pending.length === 0) { await ctx.reply("✅ Aucun retrait en attente."); return; }
     for (const w of pending) {
       const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, w.telegramId));
-      const name = u?.username ? `@${u.username}` : u?.firstName ?? w.telegramId;
+      const name = u?.username ? `@${u.username}` : (u?.firstName ?? w.telegramId);
       await ctx.reply(
         `💸 <b>Retrait #${w.id}</b>\n👤 ${name} (${w.telegramId})\n💰 ${w.amount.toLocaleString("fr-FR")} F\n💳 ${w.paymentMethod}\n📝 <code>${w.paymentDetails}</code>\n\n✅ /admin_approuver_${w.id}\n❌ /admin_rejeter_${w.id} <raison>`,
         { parse_mode: "HTML" }
@@ -1074,11 +1234,22 @@ export function createBot(token: string): Telegraf {
     if (isNaN(wId)) { await ctx.reply("❌ ID invalide."); return; }
     const [w] = await db.select().from(withdrawalsTable).where(eq(withdrawalsTable.id, wId));
     if (!w || w.status !== "pending") { await ctx.reply("❌ Introuvable ou déjà traité."); return; }
-    await db.update(withdrawalsTable).set({ status: "approved", processedAt: new Date() }).where(eq(withdrawalsTable.id, wId));
+    const now = new Date();
+    await db.update(withdrawalsTable).set({ status: "approved", processedAt: now }).where(eq(withdrawalsTable.id, wId));
+
+    // Edit proof message → approved
+    if (w.proofMessageId && w.proofChannelId) {
+      const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, w.telegramId));
+      const displayName = u?.username ? `@${u.username}` : (u?.firstName ?? w.telegramId);
+      await editWithdrawalProof(bot.telegram, w.proofChannelId, w.proofMessageId, w, displayName, "approved", { approvedAt: now });
+    }
+
     try {
-      await ctx.telegram.sendMessage(w.telegramId, `✅ <b>Retrait #${w.id} approuvé !</b>\n💰 ${w.amount.toLocaleString("fr-FR")} F via ${w.paymentMethod}\n🎉 Traitement en cours.`, { parse_mode: "HTML" });
+      await ctx.telegram.sendMessage(w.telegramId,
+        `✅ <b>Retrait Approuvé !</b>\n\n🆔 #${String(w.id).padStart(5, "0")}\n💰 ${w.amount.toLocaleString("fr-FR")} F via ${w.paymentMethod}\n🎉 Votre paiement est en cours de traitement.`,
+        { parse_mode: "HTML" });
     } catch { }
-    await ctx.reply(`✅ Retrait #${wId} approuvé.`);
+    await ctx.reply(`✅ Retrait #${wId} approuvé. Preuve mise à jour.`);
   });
 
   bot.hears(/^\/admin_rejeter_(\d+)(?:\s+(.+))?$/, async (ctx) => {
@@ -1089,10 +1260,20 @@ export function createBot(token: string): Telegraf {
     if (!w || w.status !== "pending") { await ctx.reply("❌ Introuvable ou déjà traité."); return; }
     await db.update(withdrawalsTable).set({ status: "rejected", processedAt: new Date(), adminNote: reason }).where(eq(withdrawalsTable.id, wId));
     const [restored] = await db.update(usersTable).set({ balance: sql`${usersTable.balance} + ${w.amount}` }).where(eq(usersTable.telegramId, w.telegramId)).returning();
+
+    // Edit proof message → rejected
+    if (w.proofMessageId && w.proofChannelId) {
+      const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, w.telegramId));
+      const displayName = u?.username ? `@${u.username}` : (u?.firstName ?? w.telegramId);
+      await editWithdrawalProof(bot.telegram, w.proofChannelId, w.proofMessageId, w, displayName, "rejected", { reason });
+    }
+
     try {
-      await ctx.telegram.sendMessage(w.telegramId, `❌ <b>Retrait #${w.id} refusé</b>\n📋 Raison : <i>${reason}</i>\n💵 Solde recrédité : <b>${restored!.balance.toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML" });
+      await ctx.telegram.sendMessage(w.telegramId,
+        `❌ <b>Retrait Refusé</b>\n\n🆔 #${String(w.id).padStart(5, "0")}\n📋 Raison : <i>${reason}</i>\n💵 Solde recrédité : <b>${restored!.balance.toLocaleString("fr-FR")} F</b>`,
+        { parse_mode: "HTML" });
     } catch { }
-    await ctx.reply(`❌ Retrait #${wId} refusé. Solde recrédité.`);
+    await ctx.reply(`❌ Retrait #${wId} refusé. Solde recrédité. Preuve mise à jour.`);
   });
 
   bot.catch((err, ctx) => {
@@ -1102,35 +1283,30 @@ export function createBot(token: string): Telegraf {
   return bot;
 }
 
-// ─── Broadcast helper functions ──────────────────────────────────────────────
+// ─── Helpers broadcast ────────────────────────────────────────────────────────
 async function showBroadcastPreview(ctx: any, state: BroadcastState): Promise<void> {
   const typeLabel = state.msgType === "text" ? "Texte" : state.msgType === "photo" ? "Photo" : "Vidéo";
   const preview = (state.content ?? "").slice(0, 100) + ((state.content?.length ?? 0) > 100 ? "…" : "");
   await ctx.reply(
-    `👁️ <b>Aperçu du message</b>\n\n<i>${preview}</i>\n\n📊 Type : <b>${typeLabel}</b>\n\nChoisissez les destinataires :`,
+    `👁️ <b>Aperçu</b>\n\n<i>${preview || "(média sans légende)"}</i>\n\nType : <b>${typeLabel}</b>\n\nChoisissez les destinataires :`,
     {
       parse_mode: "HTML",
       ...Markup.inlineKeyboard([
         [Markup.button.callback("👥 Tous les utilisateurs", "bc_target_all")],
-        [Markup.button.callback(`✅ Actifs (${ACTIVE_USER_DAYS} derniers jours)`, "bc_target_active")],
+        [Markup.button.callback(`✅ Actifs (${ACTIVE_USER_DAYS}j)`, "bc_target_active")],
         [Markup.button.callback("❌ Annuler", "bc_cancel")],
       ]),
     }
   );
 }
 
-async function showBroadcastConfirmation(ctx: any, adminId: string, state: BroadcastState, scheduled: boolean): Promise<void> {
+async function showBroadcastConfirmation(ctx: any, state: BroadcastState): Promise<void> {
   const targets = await getBroadcastTargets(state.target ?? "all");
   const scheduleInfo = state.scheduledAt
     ? `📅 Planifiée : <b>${state.scheduledAt.toLocaleString("fr-FR")}</b>`
     : `📤 Envoi : <b>Immédiat</b>`;
   await ctx.reply(
-    `✅ <b>Confirmation de diffusion</b>\n\n` +
-    `📊 Type : <b>${state.msgType}</b>\n` +
-    `👥 Cible : <b>${state.target === "all" ? "Tous" : "Actifs"}</b> — <b>${targets.length} destinataires</b>\n` +
-    `${scheduleInfo}\n\n` +
-    `<i>Aperçu :</i>\n${(state.content ?? "").slice(0, 200)}\n\n` +
-    `⚠️ Cette action est irréversible. Confirmer ?`,
+    `✅ <b>Confirmation</b>\n\nType : <b>${state.msgType}</b>\nCible : <b>${state.target === "all" ? "Tous" : "Actifs"}</b> — <b>${targets.length} destinataires</b>\n${scheduleInfo}\n\n<i>${(state.content ?? "").slice(0, 150)}</i>\n\n⚠️ Action irréversible. Confirmer ?`,
     {
       parse_mode: "HTML",
       ...Markup.inlineKeyboard([
