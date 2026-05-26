@@ -100,7 +100,7 @@ async function getMissingChannels(telegram: Telegraf["telegram"], userId: string
   for (const ch of channels) {
     try {
       const member = await telegram.getChatMember(ch.channelId, parseInt(userId, 10));
-      if (!["member", "administrator", "creator"].includes(member.status)) missing.push(ch);
+      if (!["member", "administrator", "creator", "restricted"].includes(member.status)) missing.push(ch);
     } catch { missing.push(ch); }
   }
   return missing;
