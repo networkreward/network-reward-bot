@@ -83,6 +83,10 @@ type AdminSettingStep = "welcome_content" | "maintenance_message";
 interface AdminSettingState { step: AdminSettingStep; }
 const adminSettingState = new Map<string, AdminSettingState>();
 
+type AdminUserStep = "au_add_amount" | "au_rem_amount" | "au_bonus_amount" | "au_dm_content";
+interface AdminUserState { step: AdminUserStep; targetId: string; }
+const adminUserState = new Map<string, AdminUserState>();
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function adminIds(): string[] {
   return (process.env["ADMIN_TELEGRAM_IDS"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -319,6 +323,76 @@ export function createBot(token: string): Telegraf {
   setInterval(() => {
     processScheduledBroadcasts(bot.telegram).catch((err) => logger.error({ err }, "Erreur vérification diffusions"));
   }, 60_000);
+
+  // ─── VIP rank helper ──────────────────────────────────────────────────────
+  function vipRank(referralCount: number): string {
+    if (referralCount >= 100) return "👑 Diamant";
+    if (referralCount >= 50)  return "💎 Platine";
+    if (referralCount >= 20)  return "🥇 Or";
+    if (referralCount >= 5)   return "🥈 Argent";
+    return "🥉 Bronze";
+  }
+
+  // ─── sendAdminUserProfile ─────────────────────────────────────────────────
+  async function sendAdminUserProfile(ctx: any, targetId: string): Promise<void> {
+    const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, targetId));
+    if (!u) { await ctx.reply("❌ Utilisateur introuvable."); return; }
+
+    // Compute stats
+    const taskRows = await db.select().from(userTasksTable).where(eq(userTasksTable.telegramId, targetId));
+    const taskEarnings = taskRows.reduce((s, t) => s + t.rewardAmount, 0);
+    const referralEarnings = u.referralCount * REFERRAL_REWARD;
+    const bonusEarnings = u.welcomeBonusClaimed ? WELCOME_BONUS : 0;
+    const [approved] = await db.select({ s: sql<number>`coalesce(sum(amount),0)::int` })
+      .from(withdrawalsTable).where(and(eq(withdrawalsTable.telegramId, targetId), eq(withdrawalsTable.status, "approved")));
+    const [pending] = await db.select({ c: sql<number>`count(*)::int` })
+      .from(withdrawalsTable).where(and(eq(withdrawalsTable.telegramId, targetId), eq(withdrawalsTable.status, "pending")));
+    const totalEarned = u.balance + (approved?.s ?? 0);
+    const isActive = (Date.now() - u.createdAt.getTime()) < ACTIVE_USER_DAYS * 24 * 3_600_000;
+
+    const name = u.username ? `@${u.username}` : (u.firstName ?? "—");
+    const fullName = [u.firstName, u.lastName].filter(Boolean).join(" ") || "—";
+    const rank = vipRank(u.referralCount);
+    const statusIcon = u.isBanned ? "🚫 Banni" : isActive ? "🟢 Actif" : "🔴 Inactif";
+    const lastSeen = u.updatedAt.toLocaleDateString("fr-FR");
+    const joinDate = u.createdAt.toLocaleDateString("fr-FR");
+
+    const profile =
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `     👤  <b>PROFIL UTILISATEUR</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `🆔 <b>ID :</b>  <code>${u.telegramId}</code>\n` +
+      `👤 <b>Pseudo :</b>  ${name}\n` +
+      `📛 <b>Nom :</b>  ${fullName}\n` +
+      `🏆 <b>Rang :</b>  ${rank}\n\n` +
+      `💵 <b>Solde :</b>  <b>${u.balance.toLocaleString("fr-FR")} F</b>\n` +
+      `📈 <b>Total gagné :</b>  ${totalEarned.toLocaleString("fr-FR")} F\n` +
+      `   ↳ Parrainages : ${referralEarnings.toLocaleString("fr-FR")} F\n` +
+      `   ↳ Tâches : ${taskEarnings.toLocaleString("fr-FR")} F\n` +
+      `   ↳ Bonus : ${(bonusEarnings).toLocaleString("fr-FR")} F\n\n` +
+      `👥 <b>Parrainages :</b>  ${u.referralCount}\n` +
+      `📋 <b>Tâches complétées :</b>  ${u.tasksCompletedCount}\n` +
+      `✅ <b>Total retiré :</b>  ${(approved?.s ?? 0).toLocaleString("fr-FR")} F\n` +
+      `⏳ <b>Retraits en attente :</b>  ${pending?.c ?? 0}\n\n` +
+      `📅 <b>Inscription :</b>  ${joinDate}\n` +
+      `🕐 <b>Dernière activité :</b>  ${lastSeen}\n` +
+      `📊 <b>Statut :</b>  ${statusIcon}\n` +
+      `🚨 <b>Fraude :</b>  ${u.flaggedForFraud ? "⚠️ Signalé" : "✅ Non"}\n` +
+      `🎁 <b>Bonus bienvenue :</b>  ${u.welcomeBonusClaimed ? "✅ Réclamé" : "⏳ Non réclamé"}\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━`;
+
+    const buttons = [
+      [Markup.button.callback("➕ Ajouter solde", `au_add_${u.telegramId}`), Markup.button.callback("➖ Retirer solde", `au_rem_${u.telegramId}`)],
+      [Markup.button.callback("🎁 Envoyer bonus", `au_bonus_${u.telegramId}`), Markup.button.callback("📢 Message direct", `au_dm_${u.telegramId}`)],
+      [
+        u.isBanned ? Markup.button.callback("✅ Débannir", `au_unban_${u.telegramId}`) : Markup.button.callback("🚫 Bannir", `au_ban_${u.telegramId}`),
+        u.flaggedForFraud ? Markup.button.callback("✅ Retirer fraude", `au_unfr_${u.telegramId}`) : Markup.button.callback("⚠️ Signaler fraude", `au_fraud_${u.telegramId}`),
+      ],
+      [Markup.button.callback("📜 Historique retraits", `au_wh_${u.telegramId}`)],
+    ];
+
+    await ctx.reply(profile, { parse_mode: "HTML", ...Markup.inlineKeyboard(buttons) });
+  }
 
   // =========================================================================
   // CALLBACK ACTIONS
@@ -820,6 +894,51 @@ export function createBot(token: string): Telegraf {
         await showBroadcastConfirmation(ctx, bcState);
         return;
       }
+      // Admin user management conversation
+      const auState = adminUserState.get(telegramId);
+      if (auState) {
+        const { step, targetId } = auState;
+        if (step === "au_add_amount" || step === "au_bonus_amount") {
+          const amount = parseInt(text.replace(/[\s\u00a0,\.]/g, ""), 10);
+          if (isNaN(amount) || amount <= 0) { await ctx.reply("❌ Montant invalide."); return; }
+          adminUserState.delete(telegramId);
+          const [updated] = await db.update(usersTable).set({ balance: sql`${usersTable.balance} + ${amount}` })
+            .where(eq(usersTable.telegramId, targetId)).returning();
+          if (!updated) { await ctx.reply("❌ Utilisateur introuvable."); return; }
+          const label = step === "au_bonus_amount" ? "Bonus" : "Solde ajusté";
+          if (step === "au_bonus_amount") {
+            try {
+              await ctx.telegram.sendMessage(targetId,
+                `🎁 <b>Bonus Reçu !</b>\n\nUn administrateur vous a attribué <b>+${amount.toLocaleString("fr-FR")} F</b> !\n💵 Nouveau solde : <b>${updated.balance.toLocaleString("fr-FR")} F</b>`,
+                { parse_mode: "HTML" });
+            } catch { }
+          }
+          await ctx.reply(`✅ <b>${label} :</b> +${amount.toLocaleString("fr-FR")} F\n💵 Nouveau solde : <b>${updated.balance.toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML" });
+          await sendAdminUserProfile(ctx, targetId);
+          return;
+        }
+        if (step === "au_rem_amount") {
+          const amount = parseInt(text.replace(/[\s\u00a0,\.]/g, ""), 10);
+          if (isNaN(amount) || amount <= 0) { await ctx.reply("❌ Montant invalide."); return; }
+          adminUserState.delete(telegramId);
+          const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, targetId));
+          if (!u) { await ctx.reply("❌ Utilisateur introuvable."); return; }
+          const newBal = Math.max(0, u.balance - amount);
+          const [updated] = await db.update(usersTable).set({ balance: newBal }).where(eq(usersTable.telegramId, targetId)).returning();
+          await ctx.reply(`✅ <b>Solde retiré :</b> -${amount.toLocaleString("fr-FR")} F\n💵 Nouveau solde : <b>${updated!.balance.toLocaleString("fr-FR")} F</b>`, { parse_mode: "HTML" });
+          await sendAdminUserProfile(ctx, targetId);
+          return;
+        }
+        if (step === "au_dm_content") {
+          adminUserState.delete(telegramId);
+          try {
+            await ctx.telegram.sendMessage(targetId, `📢 <b>Message de l'Administration</b>\n\n${text}`, { parse_mode: "HTML" });
+            await ctx.reply("✅ Message envoyé avec succès.");
+          } catch { await ctx.reply("❌ Impossible d'envoyer le message (utilisateur peut avoir bloqué le bot)."); }
+          return;
+        }
+      }
+
       const settingStep = adminSettingState.get(telegramId);
       if (settingStep?.step === "welcome_content") {
         adminSettingState.delete(telegramId);
@@ -1274,6 +1393,255 @@ export function createBot(token: string): Telegraf {
         { parse_mode: "HTML" });
     } catch { }
     await ctx.reply(`❌ Retrait #${wId} refusé. Solde recrédité. Preuve mise à jour.`);
+  });
+
+  // =========================================================================
+  // ADMIN USER MANAGEMENT CALLBACKS
+  // =========================================================================
+
+  bot.action(/^au_add_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    adminUserState.set(adminId, { step: "au_add_amount", targetId });
+    await ctx.reply(`➕ <b>Ajouter au solde</b>\n\nCible : <code>${targetId}</code>\n\nMontant à ajouter (en F) ?\n/annuler_diffusion pour annuler`, { parse_mode: "HTML" });
+  });
+
+  bot.action(/^au_rem_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    adminUserState.set(adminId, { step: "au_rem_amount", targetId });
+    await ctx.reply(`➖ <b>Retirer du solde</b>\n\nCible : <code>${targetId}</code>\n\nMontant à retirer (en F) ?\n/annuler_diffusion pour annuler`, { parse_mode: "HTML" });
+  });
+
+  bot.action(/^au_bonus_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    adminUserState.set(adminId, { step: "au_bonus_amount", targetId });
+    await ctx.reply(`🎁 <b>Envoyer un bonus</b>\n\nCible : <code>${targetId}</code>\n\nMontant du bonus (en F) ?\n/annuler_diffusion pour annuler`, { parse_mode: "HTML" });
+  });
+
+  bot.action(/^au_dm_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    adminUserState.set(adminId, { step: "au_dm_content", targetId });
+    await ctx.reply(`📢 <b>Message Direct</b>\n\nCible : <code>${targetId}</code>\n\nRédigez votre message (HTML supporté) :\n/annuler_diffusion pour annuler`, { parse_mode: "HTML" });
+  });
+
+  bot.action(/^au_ban_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery("⏳ Bannissement...");
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, targetId));
+    if (!u) { await ctx.reply("❌ Introuvable."); return; }
+    await db.update(usersTable).set({ isBanned: true }).where(eq(usersTable.telegramId, targetId));
+    try { await ctx.telegram.sendMessage(targetId, "🚫 Votre compte a été suspendu par l'administration."); } catch { }
+    await ctx.reply(`🔨 <b>${u.username ? `@${u.username}` : u.firstName ?? targetId}</b> banni avec succès.`, { parse_mode: "HTML" });
+    await sendAdminUserProfile(ctx, targetId);
+  });
+
+  bot.action(/^au_unban_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery("⏳ Réactivation...");
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, targetId));
+    if (!u) { await ctx.reply("❌ Introuvable."); return; }
+    await db.update(usersTable).set({ isBanned: false }).where(eq(usersTable.telegramId, targetId));
+    try { await ctx.telegram.sendMessage(targetId, "✅ Votre compte a été réactivé. Bienvenue de retour !"); } catch { }
+    await ctx.reply(`✅ <b>${u.username ? `@${u.username}` : u.firstName ?? targetId}</b> débanni avec succès.`, { parse_mode: "HTML" });
+    await sendAdminUserProfile(ctx, targetId);
+  });
+
+  bot.action(/^au_fraud_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery("⏳ Signalement...");
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    await db.update(usersTable).set({ flaggedForFraud: true }).where(eq(usersTable.telegramId, targetId));
+    await ctx.reply(`⚠️ Compte <code>${targetId}</code> signalé pour fraude.`, { parse_mode: "HTML" });
+    await sendAdminUserProfile(ctx, targetId);
+  });
+
+  bot.action(/^au_unfr_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery("⏳ Retrait du signalement...");
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    await db.update(usersTable).set({ flaggedForFraud: false }).where(eq(usersTable.telegramId, targetId));
+    await ctx.reply(`✅ Signalement de fraude retiré pour <code>${targetId}</code>.`, { parse_mode: "HTML" });
+    await sendAdminUserProfile(ctx, targetId);
+  });
+
+  bot.action(/^au_wh_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const adminId = String(ctx.from?.id ?? "");
+    if (!adminIds().includes(adminId)) return;
+    const targetId = ctx.match[1]!;
+    const withdrawals = await db.select().from(withdrawalsTable)
+      .where(eq(withdrawalsTable.telegramId, targetId))
+      .orderBy(desc(withdrawalsTable.requestedAt)).limit(10);
+    if (withdrawals.length === 0) { await ctx.reply("📜 Aucun retrait trouvé pour cet utilisateur."); return; }
+    const statusIcons: Record<string, string> = { pending: "⏳", approved: "✅", rejected: "❌" };
+    const lines = withdrawals.map((w) =>
+      `${statusIcons[w.status] ?? "?"} <b>#${String(w.id).padStart(5, "0")}</b>  ${w.amount.toLocaleString("fr-FR")} F  ${w.paymentMethod}\n   📅 ${w.requestedAt.toLocaleDateString("fr-FR")}${w.adminNote ? `  ·  <i>${w.adminNote}</i>` : ""}`
+    );
+    await ctx.reply(`📜 <b>Historique Retraits</b>\n(<code>${targetId}</code>)\n\n${lines.join("\n\n")}`, { parse_mode: "HTML" });
+  });
+
+  // =========================================================================
+  // ADMIN USER COMMANDS
+  // =========================================================================
+
+  bot.command("admin_user", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const query = ctx.message.text.replace("/admin_user", "").trim();
+    if (!query) {
+      await ctx.reply(
+        `👤 <b>Recherche d'utilisateur</b>\n\nUsage :\n` +
+        `• /admin_user <code>123456789</code> — par ID Telegram\n` +
+        `• /admin_user <code>@username</code> — par nom d'utilisateur\n` +
+        `• /admin_user ref:<code>123456789</code> — par code de parrainage\n\n` +
+        `<i>Le code de parrainage est l'ID Telegram du parrain.</i>`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    let targetId: string | null = null;
+
+    if (query.startsWith("ref:")) {
+      // Search by referral code (= referrer's telegramId)
+      const refCode = query.slice(4).trim();
+      const [referred] = await db.select().from(usersTable)
+        .where(eq(usersTable.referredByTelegramId, refCode)).limit(1);
+      if (referred) {
+        // Show referrer profile
+        targetId = refCode;
+      } else {
+        await ctx.reply(`❌ Aucun utilisateur parrainé via le code <code>${refCode}</code>.`, { parse_mode: "HTML" });
+        return;
+      }
+    } else if (query.startsWith("@")) {
+      const uname = query.slice(1).toLowerCase();
+      const [u] = await db.select().from(usersTable)
+        .where(sql`lower(${usersTable.username}) = ${uname}`);
+      if (!u) { await ctx.reply(`❌ Utilisateur <b>${query}</b> introuvable.`, { parse_mode: "HTML" }); return; }
+      targetId = u.telegramId;
+    } else {
+      // By telegramId
+      const [u] = await db.select().from(usersTable).where(eq(usersTable.telegramId, query));
+      if (!u) { await ctx.reply(`❌ ID <code>${query}</code> introuvable.`, { parse_mode: "HTML" }); return; }
+      targetId = u.telegramId;
+    }
+
+    await sendAdminUserProfile(ctx, targetId);
+  });
+
+  // ─── /admin_top — top earners ─────────────────────────────────────────────
+  bot.command("admin_top", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const arg = ctx.message.text.split(" ")[1]?.toLowerCase() ?? "solde";
+
+    const [topBalance, topRefs, topTasks] = await Promise.all([
+      db.select().from(usersTable)
+        .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false)))
+        .orderBy(desc(usersTable.balance)).limit(5),
+      db.select().from(usersTable)
+        .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false)))
+        .orderBy(desc(usersTable.referralCount)).limit(5),
+      db.select().from(usersTable)
+        .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false)))
+        .orderBy(desc(usersTable.tasksCompletedCount)).limit(5),
+    ]);
+
+    const fmt = (u: typeof usersTable.$inferSelect, i: number, field: "balance" | "refs" | "tasks") => {
+      const medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
+      const name = u.username ? `@${u.username}` : (u.firstName ?? u.telegramId);
+      const val = field === "balance" ? `${u.balance.toLocaleString("fr-FR")} F`
+                : field === "refs" ? `${u.referralCount} filleuls`
+                : `${u.tasksCompletedCount} tâches`;
+      return `${medals[i] ?? `${i + 1}.`} ${name} — <b>${val}</b>`;
+    };
+
+    await ctx.reply(
+      `🏆 <b>Top Utilisateurs</b>\n\n` +
+      `💰 <b>Meilleurs Soldes</b>\n${topBalance.map((u, i) => fmt(u, i, "balance")).join("\n")}\n\n` +
+      `👥 <b>Meilleurs Parrains</b>\n${topRefs.map((u, i) => fmt(u, i, "refs")).join("\n")}\n\n` +
+      `📋 <b>Meilleurs Actifs (Tâches)</b>\n${topTasks.map((u, i) => fmt(u, i, "tasks")).join("\n")}`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ─── /admin_actifs — active/inactive users ────────────────────────────────
+  bot.command("admin_actifs", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const cutoff30 = new Date(Date.now() - 30 * 24 * 3_600_000);
+    const cutoff7  = new Date(Date.now() - 7  * 24 * 3_600_000);
+    const cutoff1  = new Date(Date.now() - 1  * 24 * 3_600_000);
+
+    const [total, last30, last7, last1, banned, fraud] = await Promise.all([
+      db.select({ c: sql<number>`count(*)::int` }).from(usersTable),
+      db.select({ c: sql<number>`count(*)::int` }).from(usersTable)
+        .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false), gt(usersTable.createdAt, cutoff30))),
+      db.select({ c: sql<number>`count(*)::int` }).from(usersTable)
+        .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false), gt(usersTable.createdAt, cutoff7))),
+      db.select({ c: sql<number>`count(*)::int` }).from(usersTable)
+        .where(and(eq(usersTable.isBanned, false), eq(usersTable.flaggedForFraud, false), gt(usersTable.createdAt, cutoff1))),
+      db.select({ c: sql<number>`count(*)::int` }).from(usersTable).where(eq(usersTable.isBanned, true)),
+      db.select({ c: sql<number>`count(*)::int` }).from(usersTable).where(eq(usersTable.flaggedForFraud, true)),
+    ]);
+
+    const totalN = total[0]?.c ?? 0;
+    const active30 = last30[0]?.c ?? 0;
+    const active7  = last7[0]?.c ?? 0;
+    const active1  = last1[0]?.c ?? 0;
+    const bannedN  = banned[0]?.c ?? 0;
+    const fraudN   = fraud[0]?.c ?? 0;
+    const inactive = totalN - active30 - bannedN - fraudN;
+
+    const pct = (n: number) => totalN > 0 ? `${Math.round((n / totalN) * 100)}%` : "0%";
+    const bar = (n: number) => "█".repeat(Math.min(10, Math.round((n / Math.max(totalN, 1)) * 10))) || "░";
+
+    await ctx.reply(
+      `📊 <b>Activité Utilisateurs</b>\n\n` +
+      `👥 Total inscrit : <b>${totalN}</b>\n\n` +
+      `🟢 <b>Actifs (30j) :</b>  ${active30}  <i>${pct(active30)}</i>\n${bar(active30)}\n` +
+      `🟡 <b>Actifs (7j) :</b>   ${active7}  <i>${pct(active7)}</i>\n${bar(active7)}\n` +
+      `⚡ <b>Actifs (24h) :</b>  ${active1}  <i>${pct(active1)}</i>\n${bar(active1)}\n\n` +
+      `🔴 <b>Inactifs (>30j) :</b>  ${inactive}  <i>${pct(inactive)}</i>\n` +
+      `🚫 <b>Bannis :</b>  ${bannedN}\n` +
+      `⚠️ <b>Fraudes :</b>  ${fraudN}`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // ─── /admin_search — search by username partial match ─────────────────────
+  bot.command("admin_search", async (ctx) => {
+    if (!(await isAdmin(ctx))) return;
+    const query = ctx.message.text.replace("/admin_search", "").trim();
+    if (!query || query.length < 2) { await ctx.reply("Usage : /admin_search <terme> (min 2 caractères)"); return; }
+    const term = query.replace("@", "").toLowerCase();
+    const results = await db.select().from(usersTable)
+      .where(sql`lower(${usersTable.username}) like ${"%" + term + "%"} or lower(${usersTable.firstName}) like ${"%" + term + "%"}`)
+      .limit(8);
+    if (results.length === 0) { await ctx.reply(`❌ Aucun résultat pour "<b>${query}</b>".`, { parse_mode: "HTML" }); return; }
+    const lines = results.map((u) => {
+      const name = u.username ? `@${u.username}` : (u.firstName ?? "—");
+      return `• ${name} — <code>${u.telegramId}</code>  ${vipRank(u.referralCount)}\n  💰 ${u.balance.toLocaleString("fr-FR")} F · 👥 ${u.referralCount} · ${u.isBanned ? "🚫" : "✅"}`;
+    });
+    await ctx.reply(
+      `🔍 <b>Résultats (${results.length})</b>\n\n${lines.join("\n\n")}\n\n<i>Utilisez /admin_user &lt;ID&gt; pour le profil complet.</i>`,
+      { parse_mode: "HTML" }
+    );
   });
 
   bot.catch((err, ctx) => {
